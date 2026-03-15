@@ -37,3 +37,6 @@ skills-lock.json
 
 # vite cache
 .vite/
+
+# Go binary
+claude-monitor
