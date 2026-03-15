@@ -2,57 +2,157 @@ package scanner
 
 import (
 	"context"
+	"fmt"
+	"sync"
 	"testing"
+	"time"
+
+	"github.com/universe/claude-monitor/internal/model"
 )
 
-func TestNew(t *testing.T) {
-	sc := New()
-	if sc == nil {
+func TestScanner_New(t *testing.T) {
+	s := New()
+	if s == nil {
 		t.Fatal("New() returned nil")
+	}
+	if s.claude == nil {
+		t.Fatal("New() did not initialize claude scanner")
 	}
 }
 
 func TestScanner_Scan(t *testing.T) {
+	startedAt := time.Now().UTC().Add(-1 * time.Hour).Truncate(time.Second)
+
 	tests := map[string]struct {
-		ctx       context.Context
-		wantCount int
-		wantErr   bool
+		buildFS      func(t *testing.T, homeDir string)
+		sessionCount int
 	}{
-		"returns_no_error_with_valid_context": {
-			ctx:       context.Background(),
-			wantCount: 0, // stub returns nil slice
-			wantErr:   false,
+		"returns_sessions_from_claude_scanner": {
+			buildFS: func(t *testing.T, homeDir string) {
+				writeSessionFile(t, homeDir, "s1.json", sessionFile{
+					PID:       999999999,
+					SessionID: "s1",
+					Cwd:       "/tmp/proj1",
+					StartedAt: startedAt.Format(time.RFC3339),
+				})
+				writeSessionFile(t, homeDir, "s2.json", sessionFile{
+					PID:       999999998,
+					SessionID: "s2",
+					Cwd:       "/tmp/proj2",
+					StartedAt: startedAt.Format(time.RFC3339),
+				})
+			},
+			sessionCount: 2,
 		},
-		"returns_no_error_with_cancelled_context": {
-			// Once implemented, a cancelled context should propagate;
-			// for now the stub ignores it. This test documents the expected contract.
-			ctx:       cancelledContext(),
-			wantCount: 0,
-			wantErr:   false, // stub; will change when implemented
+		"empty_when_no_sessions": {
+			sessionCount: 0,
 		},
 	}
 
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			sc := New()
-			sessions, err := sc.Scan(tt.ctx)
-
-			if tt.wantErr && err == nil {
-				t.Error("expected error, got nil")
-			}
-			if !tt.wantErr && err != nil {
-				t.Errorf("unexpected error: %v", err)
+			homeDir := t.TempDir()
+			if tt.buildFS != nil {
+				tt.buildFS(t, homeDir)
 			}
 
-			if len(sessions) != tt.wantCount {
-				t.Errorf("session count: got %d, want %d", len(sessions), tt.wantCount)
+			s := &Scanner{
+				claude: newClaudeScanner(homeDir),
+			}
+
+			got, err := s.Scan(context.Background())
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			if len(got) != tt.sessionCount {
+				t.Fatalf("expected %d sessions, got %d: %+v", tt.sessionCount, len(got), got)
+			}
+
+			// Every session from the aggregator must have ProviderClaude
+			// (only Claude scanner exists currently).
+			for i, sess := range got {
+				if sess.Provider != model.ProviderClaude {
+					t.Errorf("session[%d].Provider = %q, want %q", i, sess.Provider, model.ProviderClaude)
+				}
 			}
 		})
 	}
 }
 
-func cancelledContext() context.Context {
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	return ctx
+// TestScanner_Scan_SortedByLastActiveDesc verifies that Scanner.Scan returns
+// sessions sorted by LastActive descending (most recent first).
+func TestScanner_Scan_SortedByLastActiveDesc(t *testing.T) {
+	homeDir := t.TempDir()
+	now := time.Now().UTC().Truncate(time.Second)
+	startedAt := now.Add(-1 * time.Hour)
+
+	// Create 3 sessions with different LastActive times via JSONL timestamps.
+	cwds := []string{"/proj/oldest", "/proj/middle", "/proj/newest"}
+	sids := []string{"sess-old", "sess-mid", "sess-new"}
+	lastActives := []time.Duration{-10 * time.Minute, -5 * time.Minute, -1 * time.Minute}
+
+	for i := range sids {
+		writeSessionFile(t, homeDir, sids[i]+".json", sessionFile{
+			PID:       999999999 - i,
+			SessionID: sids[i],
+			Cwd:       cwds[i],
+			StartedAt: startedAt.Format(time.RFC3339),
+		})
+		encoded := encodeCwd(cwds[i])
+		writeConversationJSONL(t, homeDir, encoded, sids[i], []jsonlMessage{
+			{Role: "user", Timestamp: now.Add(lastActives[i]), Message: "msg"},
+		})
+	}
+
+	s := &Scanner{claude: newClaudeScanner(homeDir)}
+	got, err := s.Scan(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("expected 3 sessions, got %d", len(got))
+	}
+
+	// Verify descending order by LastActive.
+	for i := 1; i < len(got); i++ {
+		if got[i].LastActive.After(got[i-1].LastActive) {
+			t.Errorf("sessions not sorted by LastActive desc: session[%d].LastActive=%v is after session[%d].LastActive=%v",
+				i, got[i].LastActive, i-1, got[i-1].LastActive)
+		}
+	}
+
+	// The newest session should be first.
+	if got[0].ID != "sess-new" {
+		t.Errorf("expected first session to be sess-new, got %q", got[0].ID)
+	}
+}
+
+// TestScanner_Scan_ConcurrencySafe verifies that the goroutine+WaitGroup pattern
+// in Scanner.Scan doesn't race. Run with -race flag.
+func TestScanner_Scan_ConcurrencySafe(t *testing.T) {
+	homeDir := t.TempDir()
+	startedAt := time.Now().UTC().Add(-1 * time.Hour).Truncate(time.Second)
+
+	for i := range 5 {
+		sid := fmt.Sprintf("sess-race-%d", i)
+		writeSessionFile(t, homeDir, sid+".json", sessionFile{
+			PID:       999999990 + i,
+			SessionID: sid,
+			Cwd:       "/tmp",
+			StartedAt: startedAt.Format(time.RFC3339),
+		})
+	}
+
+	s := &Scanner{claude: newClaudeScanner(homeDir)}
+
+	var wg sync.WaitGroup
+	for range 10 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _ = s.Scan(context.Background())
+		}()
+	}
+	wg.Wait()
 }
