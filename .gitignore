@@ -39,4 +39,4 @@ skills-lock.json
 .vite/
 
 # Go binary
-claude-monitor
+/claude-monitor
