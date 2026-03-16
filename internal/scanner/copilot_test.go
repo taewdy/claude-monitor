@@ -29,10 +29,6 @@ type workspaceYAML struct {
 type copilotEvent struct {
 	Type      string `json:"type"`
 	Timestamp int64  `json:"timestamp"`
-	Tokens    *struct {
-		Input  int64 `json:"input"`
-		Output int64 `json:"output"`
-	} `json:"tokens,omitempty"`
 }
 
 // ideLockFile represents the content of an IDE lock file.
@@ -42,17 +38,6 @@ type ideLockFile struct {
 }
 
 // ---------- test helpers ----------
-
-// testTokens returns a token pointer suitable for copilotEvent.Tokens.
-func testTokens(in, out int64) *struct {
-	Input  int64 `json:"input"`
-	Output int64 `json:"output"`
-} {
-	return &struct {
-		Input  int64 `json:"input"`
-		Output int64 `json:"output"`
-	}{Input: in, Output: out}
-}
 
 // writeWorkspaceYAML writes a simple workspace.yaml file for a copilot session.
 // We write the YAML manually to avoid a yaml dependency in tests.
@@ -148,12 +133,6 @@ func assertCopilotSession(t *testing.T, idx int, got, want model.SessionInfo) {
 	}
 	if got.GitBranch != want.GitBranch {
 		t.Errorf("session[%d].GitBranch = %q, want %q", idx, got.GitBranch, want.GitBranch)
-	}
-	if got.InputTokens != want.InputTokens {
-		t.Errorf("session[%d].InputTokens = %d, want %d", idx, got.InputTokens, want.InputTokens)
-	}
-	if got.OutputTokens != want.OutputTokens {
-		t.Errorf("session[%d].OutputTokens = %d, want %d", idx, got.OutputTokens, want.OutputTokens)
 	}
 }
 
@@ -410,33 +389,6 @@ func TestCopilotScanner_Scan(t *testing.T) {
 			},
 			// Should parse valid lines, skip bad ones.
 			count: 1,
-		},
-		"token_accumulation_from_events": {
-			buildFS: func(t *testing.T, homeDir string) {
-				sid := "token-uuid"
-				writeWorkspaceYAML(t, homeDir, sid, workspaceYAML{
-					ID: sid, Cwd: "/proj", GitBranch: "main",
-					CreatedAt: now.Add(-1 * time.Hour), UpdatedAt: now.Add(-10 * time.Second),
-					Summary: "Tokens",
-				})
-				writeEventsJSONL(t, homeDir, sid, []copilotEvent{
-					{Type: "user.message", Timestamp: now.Add(-30 * time.Second).Unix(), Tokens: testTokens(100, 0)},
-					{Type: "assistant.message", Timestamp: now.Add(-20 * time.Second).Unix(), Tokens: testTokens(0, 500)},
-					{Type: "user.message", Timestamp: now.Add(-10 * time.Second).Unix(), Tokens: testTokens(200, 0)},
-				})
-			},
-			sessions: []model.SessionInfo{
-				{
-					ID:           "token-uuid",
-					Provider:     model.ProviderCopilot,
-					Status:       model.StatusActive,
-					Title:        "Tokens",
-					ProjectDir:   "/proj",
-					GitBranch:    "main",
-					InputTokens:  300,
-					OutputTokens: 500,
-				},
-			},
 		},
 		"empty_events_jsonl": {
 			buildFS: func(t *testing.T, homeDir string) {

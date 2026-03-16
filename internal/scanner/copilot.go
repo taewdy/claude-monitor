@@ -84,13 +84,10 @@ func (c *copilotScanner) parseSession(sid string) (*model.SessionInfo, error) {
 	// Parse events.jsonl
 	events := c.parseEventsJSONL(filepath.Join(sessionDir, "events.jsonl"))
 
-	// Determine status, tokens, and last event time
 	var (
 		lastEventType string
 		lastEventTime time.Time
 		hasShutdown   bool
-		inputTokens   int64
-		outputTokens  int64
 	)
 
 	for _, e := range events {
@@ -101,10 +98,6 @@ func (c *copilotScanner) parseSession(sid string) (*model.SessionInfo, error) {
 		}
 		if e.Type == "session.shutdown" {
 			hasShutdown = true
-		}
-		if e.Tokens != nil {
-			inputTokens += e.Tokens.Input
-			outputTokens += e.Tokens.Output
 		}
 	}
 
@@ -117,17 +110,17 @@ func (c *copilotScanner) parseSession(sid string) (*model.SessionInfo, error) {
 	// Determine status
 	status := c.determineStatus(sid, hasShutdown, lastEventType, lastEventTime, len(events))
 
+	// Copilot CLI does not expose token usage in its event stream,
+	// so InputTokens and OutputTokens are left at their zero values.
 	info := &model.SessionInfo{
-		ID:           ws.id,
-		Provider:     model.ProviderCopilot,
-		Status:       status,
-		Title:        ws.summary,
-		ProjectDir:   ws.cwd,
-		GitBranch:    ws.gitBranch,
-		StartedAt:    ws.createdAt,
-		LastActive:   lastActive,
-		InputTokens:  inputTokens,
-		OutputTokens: outputTokens,
+		ID:         ws.id,
+		Provider:   model.ProviderCopilot,
+		Status:     status,
+		Title:      ws.summary,
+		ProjectDir: ws.cwd,
+		GitBranch:  ws.gitBranch,
+		StartedAt:  ws.createdAt,
+		LastActive: lastActive,
 	}
 
 	return info, nil
@@ -248,10 +241,6 @@ func parseYAMLLine(line string) (key, value string, ok bool) {
 type copilotEventParsed struct {
 	Type      string `json:"type"`
 	Timestamp int64  `json:"timestamp"`
-	Tokens    *struct {
-		Input  int64 `json:"input"`
-		Output int64 `json:"output"`
-	} `json:"tokens,omitempty"`
 }
 
 // parseEventsJSONL reads and parses events from an events.jsonl file, skipping bad lines.
