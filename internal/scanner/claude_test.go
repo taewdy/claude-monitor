@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -550,17 +551,37 @@ func TestClaudeScanner_Scan(t *testing.T) {
 	}
 }
 
-// TestClaudeScanner_StatusDetermination tests the four status rules:
-//   - PID dead → finished
-//   - PID alive + last msg < 60s → active
-//   - PID alive + last msg > 60s → idle
-//   - PID alive + last msg is assistant role → waiting
+// TestClaudeScanner_StatusDetermination tests the status priority rules:
+//  1. PID dead → finished
+//  2. PID alive + CPU > 0.1% → active (uses os.Getpid())
+//  3. PID alive + lastActive within 5 min → active
+//  4. PID alive + lastActive is zero → active
+//  5. PID alive + last msg assistant → waiting
+//  6. default → idle
 //
-// We use os.Getpid() as a known-alive PID for the live-PID cases.
+// Tests that need to exercise JSONL-based fallback logic (idle, waiting) use
+// PID 1 (launchd — alive but ~0% CPU) so isProcessActive doesn't short-circuit.
+// Tests for CPU-based detection use os.Getpid() (test runner, always >0.1% CPU).
 func TestClaudeScanner_StatusDetermination(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	startedAt := now.Add(-1 * time.Hour)
-	alivePID := os.Getpid()
+
+	// Track which PIDs the test considers "CPU active" so we can override
+	// isProcessActive deterministically without relying on real CPU sampling.
+	cpuActivePIDs := map[int]bool{}
+	origIsProcessActive := isProcessActive
+	isProcessActive = func(pid int) bool { return cpuActivePIDs[pid] }
+	t.Cleanup(func() { isProcessActive = origIsProcessActive })
+
+	// Use the current PID as a sentinel that we'll mark as CPU-active.
+	cpuActivePID := os.Getpid()
+	cpuActivePIDs[cpuActivePID] = true
+
+	// For low-CPU tests we need a separate alive PID not marked as CPU-active.
+	// os.Getppid() is alive and passes isProcessAlive (syscall.Kill(pid, 0)).
+	// This assumption holds on macOS; in containerized CI the parent is
+	// typically the test harness which is also signal-reachable.
+	lowCPUPID := os.Getppid()
 
 	// makeSession is a helper that writes session + optional JSONL for a given
 	// pid and message list, reducing boilerplate across status test cases.
@@ -586,42 +607,50 @@ func TestClaudeScanner_StatusDetermination(t *testing.T) {
 			},
 			status: model.StatusFinished,
 		},
-		"alive_pid_recent_user_msg_is_active": {
+		"alive_pid_high_cpu_is_active": {
 			buildFS: func(t *testing.T, homeDir string) {
-				makeSession(t, homeDir, "active", alivePID, []jsonlMessage{
-					mkMsg("user", now.Add(-5*time.Second), nil),
+				makeSession(t, homeDir, "cpu-active", cpuActivePID, []jsonlMessage{
+					mkMsg("user", now.Add(-10*time.Minute), nil),
+				})
+			},
+			status: model.StatusActive,
+		},
+		"alive_pid_recent_msg_within_5min_is_active": {
+			buildFS: func(t *testing.T, homeDir string) {
+				makeSession(t, homeDir, "recent", lowCPUPID, []jsonlMessage{
+					mkMsg("user", now.Add(-3*time.Minute), nil),
 				})
 			},
 			status: model.StatusActive,
 		},
 		"alive_pid_stale_msg_is_idle": {
 			buildFS: func(t *testing.T, homeDir string) {
-				makeSession(t, homeDir, "idle", alivePID, []jsonlMessage{
-					mkMsg("user", now.Add(-5*time.Minute), nil),
+				makeSession(t, homeDir, "idle", lowCPUPID, []jsonlMessage{
+					mkMsg("user", now.Add(-10*time.Minute), nil),
 				})
 			},
 			status: model.StatusIdle,
 		},
 		"alive_pid_last_msg_assistant_is_waiting": {
 			buildFS: func(t *testing.T, homeDir string) {
-				makeSession(t, homeDir, "waiting", alivePID, []jsonlMessage{
-					mkMsg("user", now.Add(-5*time.Minute), nil),
-					mkMsg("assistant", now.Add(-2*time.Minute), nil),
+				makeSession(t, homeDir, "waiting", lowCPUPID, []jsonlMessage{
+					mkMsg("user", now.Add(-10*time.Minute), nil),
+					mkMsg("assistant", now.Add(-6*time.Minute), nil),
 				})
 			},
 			status: model.StatusWaiting,
 		},
 		"alive_pid_no_messages_is_active": {
 			buildFS: func(t *testing.T, homeDir string) {
-				makeSession(t, homeDir, "no-msgs", alivePID, nil)
+				makeSession(t, homeDir, "no-msgs", lowCPUPID, nil)
 			},
 			status: model.StatusActive,
 		},
-		"alive_pid_recent_assistant_msg_is_active": {
+		"alive_pid_recent_assistant_msg_within_5min_is_active": {
 			buildFS: func(t *testing.T, homeDir string) {
-				makeSession(t, homeDir, "recent-asst", alivePID, []jsonlMessage{
-					mkMsg("user", now.Add(-10*time.Second), nil),
-					mkMsg("assistant", now.Add(-5*time.Second), nil),
+				makeSession(t, homeDir, "recent-asst", lowCPUPID, []jsonlMessage{
+					mkMsg("user", now.Add(-4*time.Minute), nil),
+					mkMsg("assistant", now.Add(-2*time.Minute), nil),
 				})
 			},
 			status: model.StatusActive,
@@ -645,6 +674,33 @@ func TestClaudeScanner_StatusDetermination(t *testing.T) {
 				t.Errorf("status = %q, want %q", got[0].Status, tt.status)
 			}
 		})
+	}
+}
+
+// TestDefaultIsProcessActive tests the real ps-based implementation directly
+// (not the overridable var) to verify it correctly parses CPU output.
+func TestDefaultIsProcessActive(t *testing.T) {
+	// Spawn a CPU-busy process so we have a reliable high-CPU PID to test.
+	busyCmd := exec.Command("bash", "-c", "while true; do :; done")
+	if err := busyCmd.Start(); err != nil {
+		t.Fatalf("failed to start busy process: %v", err)
+	}
+	t.Cleanup(func() { busyCmd.Process.Kill(); busyCmd.Wait() })
+
+	// Poll until ps reports >0.1% CPU. The kernel's CPU accounting needs time
+	// to accumulate; 100ms is often not enough, so we retry up to 2s.
+	pid := busyCmd.Process.Pid
+	deadline := time.Now().Add(2 * time.Second)
+	for !defaultIsProcessActive(pid) {
+		if time.Now().After(deadline) {
+			t.Fatal("defaultIsProcessActive(busy process) never returned true within 2s")
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	// A non-existent PID should return false.
+	if defaultIsProcessActive(999999999) {
+		t.Error("defaultIsProcessActive(999999999) = true, want false")
 	}
 }
 
