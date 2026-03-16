@@ -117,6 +117,16 @@ func encodeCwd(path string) string {
 	return strings.ReplaceAll(path, "/", "-")
 }
 
+// setFileMtime sets the modification time on the JSONL file for the given session.
+func setFileMtime(t *testing.T, homeDir, sid, cwd string, mtime time.Time) {
+	t.Helper()
+	encoded := encodeCwd(cwd)
+	jsonlPath := filepath.Join(homeDir, ".claude", "projects", encoded, sid+".jsonl")
+	if err := os.Chtimes(jsonlPath, mtime, mtime); err != nil {
+		t.Fatalf("setFileMtime: %v", err)
+	}
+}
+
 // scanSingle runs the claude scanner on the given homeDir, asserts no error and
 // exactly one result, then returns that single session.
 func scanSingle(t *testing.T, homeDir string) model.SessionInfo {
@@ -553,15 +563,15 @@ func TestClaudeScanner_Scan(t *testing.T) {
 
 // TestClaudeScanner_StatusDetermination tests the status priority rules:
 //  1. PID dead → finished
-//  2. PID alive + CPU > 0.1% → active (uses os.Getpid())
-//  3. PID alive + lastActive within 5 min → active
-//  4. PID alive + lastActive is zero → active
-//  5. PID alive + last msg assistant → waiting
+//  2. PID alive + JSONL file modified within 2 min → active
+//  3. PID alive + CPU > 2% → active (catches long tool runs)
+//  4. PID alive + mtime is zero (no JSONL file) → active (brand new session)
+//  5. PID alive + last role "assistant" → waiting
 //  6. default → idle
 //
-// Tests that need to exercise JSONL-based fallback logic (idle, waiting) use
-// PID 1 (launchd — alive but ~0% CPU) so isProcessActive doesn't short-circuit.
-// Tests for CPU-based detection use os.Getpid() (test runner, always >0.1% CPU).
+// Tests that need to exercise non-mtime fallback logic (idle, waiting, CPU)
+// set the JSONL mtime to 10 min ago via Chtimes so mtime doesn't short-circuit.
+// Tests for mtime-based detection leave the file as-is (just written, fresh mtime).
 func TestClaudeScanner_StatusDetermination(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	startedAt := now.Add(-1 * time.Hour)
@@ -609,14 +619,19 @@ func TestClaudeScanner_StatusDetermination(t *testing.T) {
 		},
 		"alive_pid_high_cpu_is_active": {
 			buildFS: func(t *testing.T, homeDir string) {
-				makeSession(t, homeDir, "cpu-active", cpuActivePID, []jsonlMessage{
+				sid := "cpu-active"
+				cwd := "/tmp/" + sid
+				makeSession(t, homeDir, sid, cpuActivePID, []jsonlMessage{
 					mkMsg("user", now.Add(-10*time.Minute), nil),
 				})
+				// Set mtime to 10 min ago so mtime doesn't short-circuit before CPU check.
+				setFileMtime(t, homeDir, sid, cwd, now.Add(-10*time.Minute))
 			},
 			status: model.StatusActive,
 		},
-		"alive_pid_recent_msg_within_5min_is_active": {
+		"alive_pid_recent_file_mtime_is_active": {
 			buildFS: func(t *testing.T, homeDir string) {
+				// File just written, mtime is fresh — no Chtimes needed.
 				makeSession(t, homeDir, "recent", lowCPUPID, []jsonlMessage{
 					mkMsg("user", now.Add(-3*time.Minute), nil),
 				})
@@ -625,18 +640,26 @@ func TestClaudeScanner_StatusDetermination(t *testing.T) {
 		},
 		"alive_pid_stale_msg_is_idle": {
 			buildFS: func(t *testing.T, homeDir string) {
-				makeSession(t, homeDir, "idle", lowCPUPID, []jsonlMessage{
+				sid := "idle"
+				cwd := "/tmp/" + sid
+				makeSession(t, homeDir, sid, lowCPUPID, []jsonlMessage{
 					mkMsg("user", now.Add(-10*time.Minute), nil),
 				})
+				// Set mtime to 10 min ago via Chtimes.
+				setFileMtime(t, homeDir, sid, cwd, now.Add(-10*time.Minute))
 			},
 			status: model.StatusIdle,
 		},
 		"alive_pid_last_msg_assistant_is_waiting": {
 			buildFS: func(t *testing.T, homeDir string) {
-				makeSession(t, homeDir, "waiting", lowCPUPID, []jsonlMessage{
+				sid := "waiting"
+				cwd := "/tmp/" + sid
+				makeSession(t, homeDir, sid, lowCPUPID, []jsonlMessage{
 					mkMsg("user", now.Add(-10*time.Minute), nil),
 					mkMsg("assistant", now.Add(-6*time.Minute), nil),
 				})
+				// Set mtime to 6 min ago via Chtimes.
+				setFileMtime(t, homeDir, sid, cwd, now.Add(-6*time.Minute))
 			},
 			status: model.StatusWaiting,
 		},
@@ -646,8 +669,9 @@ func TestClaudeScanner_StatusDetermination(t *testing.T) {
 			},
 			status: model.StatusActive,
 		},
-		"alive_pid_recent_assistant_msg_within_5min_is_active": {
+		"alive_pid_recent_assistant_msg_within_2min_is_active": {
 			buildFS: func(t *testing.T, homeDir string) {
+				// File just written, mtime is fresh — still active despite assistant last role.
 				makeSession(t, homeDir, "recent-asst", lowCPUPID, []jsonlMessage{
 					mkMsg("user", now.Add(-4*time.Minute), nil),
 					mkMsg("assistant", now.Add(-2*time.Minute), nil),
@@ -679,6 +703,7 @@ func TestClaudeScanner_StatusDetermination(t *testing.T) {
 
 // TestDefaultIsProcessActive tests the real ps-based implementation directly
 // (not the overridable var) to verify it correctly parses CPU output.
+// The busy-loop process pegs 100% CPU so it still exceeds the 2% threshold.
 func TestDefaultIsProcessActive(t *testing.T) {
 	// Spawn a CPU-busy process so we have a reliable high-CPU PID to test.
 	busyCmd := exec.Command("bash", "-c", "while true; do :; done")

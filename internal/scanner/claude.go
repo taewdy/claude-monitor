@@ -104,8 +104,14 @@ func (c *claudeScanner) processSessionFile(path string) (model.SessionInfo, bool
 		info.SubagentCount = len(entries)
 	}
 
-	// Determine status.
-	info.Status = c.determineStatus(sf.PID, info.LastActive, lastRole)
+	// Get JSONL file modification time for freshness-based status detection.
+	var jsonlMtime time.Time
+	if fi, err := os.Stat(jsonlPath); err == nil {
+		jsonlMtime = fi.ModTime()
+	}
+
+	// Determine status using file mtime (not content timestamps).
+	info.Status = c.determineStatus(sf.PID, jsonlMtime, lastRole)
 
 	return info, true
 }
@@ -182,27 +188,28 @@ func readTailLines(r io.Reader, n int) []string {
 	return ring[len(ring)-n:]
 }
 
-// determineStatus applies the status rules:
+// determineStatus applies the status rules using JSONL file mtime as the
+// primary freshness signal (cheap os.Stat before expensive ps shell-out):
 //  1. PID dead → finished
-//  2. PID alive + CPU > 0.1% (isProcessActive) → active
-//  3. PID alive + lastActive within 5 min → active
-//  4. PID alive + lastActive is zero → active
-//  5. PID alive + last msg is assistant role → waiting
+//  2. PID alive + JSONL file modified within 2 min → active
+//  3. PID alive + CPU > 2% → active (catches long tool runs)
+//  4. PID alive + mtime is zero (no JSONL file) → active (brand new session)
+//  5. PID alive + last role "assistant" → waiting
 //  6. default → idle
-func (c *claudeScanner) determineStatus(pid int, lastActive time.Time, lastRole string) model.Status {
+func (c *claudeScanner) determineStatus(pid int, jsonlMtime time.Time, lastRole string) model.Status {
 	if !isProcessAlive(pid) {
 		return model.StatusFinished
+	}
+
+	if !jsonlMtime.IsZero() && time.Since(jsonlMtime) < 2*time.Minute {
+		return model.StatusActive
 	}
 
 	if isProcessActive(pid) {
 		return model.StatusActive
 	}
 
-	if !lastActive.IsZero() && time.Since(lastActive) < 5*time.Minute {
-		return model.StatusActive
-	}
-
-	if lastActive.IsZero() {
+	if jsonlMtime.IsZero() {
 		return model.StatusActive
 	}
 
@@ -214,7 +221,7 @@ func (c *claudeScanner) determineStatus(pid int, lastActive time.Time, lastRole 
 }
 
 // isProcessActive checks if a process is actively using CPU by shelling out to
-// ps and checking if CPU usage exceeds 0.1%. Returns false on any error.
+// ps and checking if CPU usage exceeds 2.0%. Returns false on any error.
 // Declared as a variable so tests can override it.
 var isProcessActive = defaultIsProcessActive
 
@@ -227,7 +234,7 @@ func defaultIsProcessActive(pid int) bool {
 	if err != nil {
 		return false
 	}
-	return cpu > 0.1
+	return cpu > 2.0
 }
 
 // isProcessAlive checks if a process with the given PID exists.
