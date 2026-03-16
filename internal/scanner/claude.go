@@ -6,7 +6,6 @@ import (
 	"context"
 	"encoding/json"
 	"io"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -93,7 +92,7 @@ func (c *claudeScanner) processSessionFile(path string) (model.SessionInfo, bool
 	}
 
 	// Parse conversation JSONL for message stats.
-	encoded := url.PathEscape(sf.Cwd)
+	encoded := strings.ReplaceAll(sf.Cwd, "/", "-")
 	jsonlPath := filepath.Join(c.homeDir, ".claude", "projects", encoded, sf.SessionID+".jsonl")
 	lastRole := c.parseConversation(jsonlPath, &info)
 
@@ -124,20 +123,28 @@ func (c *claudeScanner) parseConversation(path string, info *model.SessionInfo) 
 	var lastRole string
 	for _, line := range lines {
 		var msg struct {
-			Role      string    `json:"role"`
+			Type      string    `json:"type"`
 			Timestamp time.Time `json:"timestamp"`
 			Slug      string    `json:"slug,omitempty"`
-			Usage     *struct {
-				InputTokens  int64 `json:"inputTokens"`
-				OutputTokens int64 `json:"outputTokens"`
-			} `json:"usage,omitempty"`
+			Message   *struct {
+				Role  string `json:"role"`
+				Usage *struct {
+					InputTokens              int64 `json:"input_tokens"`
+					OutputTokens             int64 `json:"output_tokens"`
+					CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
+					CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
+				} `json:"usage,omitempty"`
+			} `json:"message,omitempty"`
 		}
 		if err := json.Unmarshal([]byte(line), &msg); err != nil {
 			continue
 		}
 
 		info.MessageCount++
-		lastRole = msg.Role
+
+		if msg.Message != nil {
+			lastRole = msg.Message.Role
+		}
 
 		if !msg.Timestamp.IsZero() {
 			info.LastActive = msg.Timestamp
@@ -145,9 +152,10 @@ func (c *claudeScanner) parseConversation(path string, info *model.SessionInfo) 
 		if msg.Slug != "" {
 			info.Title = msg.Slug
 		}
-		if msg.Usage != nil {
-			info.InputTokens += msg.Usage.InputTokens
-			info.OutputTokens += msg.Usage.OutputTokens
+		if msg.Message != nil && msg.Message.Usage != nil {
+			u := msg.Message.Usage
+			info.InputTokens += u.InputTokens + u.CacheReadInputTokens + u.CacheCreationInputTokens
+			info.OutputTokens += u.OutputTokens
 		}
 	}
 

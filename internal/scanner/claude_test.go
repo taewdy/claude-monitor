@@ -4,9 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -23,17 +23,40 @@ type sessionFile struct {
 }
 
 // jsonlMessage represents a single line in a conversation JSONL file.
+// Matches the actual Claude Code format with nested message object and snake_case fields.
 type jsonlMessage struct {
-	Role      string    `json:"role"`
-	Timestamp time.Time `json:"timestamp"`
-	Message   string    `json:"message,omitempty"`
-	Usage     *usage    `json:"usage,omitempty"`
-	Slug      string    `json:"slug,omitempty"`
+	Type      string         `json:"type"`
+	Timestamp time.Time      `json:"timestamp"`
+	Slug      string         `json:"slug,omitempty"`
+	Message   *nestedMessage `json:"message,omitempty"`
+}
+
+type nestedMessage struct {
+	Role  string `json:"role"`
+	Usage *usage `json:"usage,omitempty"`
 }
 
 type usage struct {
-	InputTokens  int64 `json:"inputTokens"`
-	OutputTokens int64 `json:"outputTokens"`
+	InputTokens              int64 `json:"input_tokens"`
+	OutputTokens             int64 `json:"output_tokens"`
+	CacheReadInputTokens     int64 `json:"cache_read_input_tokens,omitempty"`
+	CacheCreationInputTokens int64 `json:"cache_creation_input_tokens,omitempty"`
+}
+
+// mkMsg creates a jsonlMessage with the nested structure matching Claude Code's actual format.
+func mkMsg(role string, ts time.Time, u *usage) jsonlMessage {
+	return jsonlMessage{
+		Type:      role,
+		Timestamp: ts,
+		Message:   &nestedMessage{Role: role, Usage: u},
+	}
+}
+
+// mkMsgSlug creates a jsonlMessage with a slug/title.
+func mkMsgSlug(role string, ts time.Time, u *usage, slug string) jsonlMessage {
+	m := mkMsg(role, ts, u)
+	m.Slug = slug
+	return m
 }
 
 // helper: write a session JSON file into the temp home dir.
@@ -87,10 +110,10 @@ func writeSubagentFiles(t *testing.T, homeDir, encodedCwd, sessionID string, cou
 	}
 }
 
-// encodeCwd encodes a filesystem path the way Claude Code does: full URL-style
-// percent-encoding where / becomes %2F, spaces become %20, etc.
+// encodeCwd encodes a filesystem path the way Claude Code does: replacing
+// "/" with "-" to produce a flat directory name.
 func encodeCwd(path string) string {
-	return url.PathEscape(path)
+	return strings.ReplaceAll(path, "/", "-")
 }
 
 // scanSingle runs the claude scanner on the given homeDir, asserts no error and
@@ -196,12 +219,9 @@ func TestClaudeScanner_Scan(t *testing.T) {
 				})
 				encoded := encodeCwd(cwd)
 				writeConversationJSONL(t, homeDir, encoded, sid, []jsonlMessage{
-					{Role: "user", Timestamp: startedAt.Add(1 * time.Minute), Message: "hello",
-						Usage: &usage{InputTokens: 100, OutputTokens: 0}},
-					{Role: "assistant", Timestamp: startedAt.Add(2 * time.Minute), Message: "hi there",
-						Usage: &usage{InputTokens: 0, OutputTokens: 250}},
-					{Role: "user", Timestamp: staleTimestamp, Message: "do something",
-						Usage: &usage{InputTokens: 150, OutputTokens: 0}},
+					mkMsg("user", startedAt.Add(1*time.Minute), &usage{InputTokens: 100, OutputTokens: 0}),
+					mkMsg("assistant", startedAt.Add(2*time.Minute), &usage{InputTokens: 0, OutputTokens: 250}),
+					mkMsg("user", staleTimestamp, &usage{InputTokens: 150, OutputTokens: 0}),
 				})
 			},
 			wants: wants{
@@ -273,7 +293,7 @@ func TestClaudeScanner_Scan(t *testing.T) {
 				})
 				encoded := encodeCwd(cwd)
 				writeConversationJSONL(t, homeDir, encoded, sid, []jsonlMessage{
-					{Role: "user", Timestamp: ts, Message: "start"},
+					mkMsg("user", ts, nil),
 				})
 				writeSubagentFiles(t, homeDir, encoded, sid, 3)
 			},
@@ -335,9 +355,6 @@ func TestClaudeScanner_Scan(t *testing.T) {
 				if err := os.MkdirAll(dir, 0o755); err != nil {
 					t.Fatal(err)
 				}
-				// Design choice: unparseable startedAt causes the session to be skipped entirely.
-				// Alternative (returning session with zero StartedAt) would also be "graceful",
-				// but skipping is preferred since startedAt is a required field for useful output.
 				data := `{"pid":999999999,"sessionId":"sess-bad-time","cwd":"/tmp","startedAt":"not-a-date"}`
 				if err := os.WriteFile(filepath.Join(dir, "sess-bad-time.json"), []byte(data), 0o644); err != nil {
 					t.Fatal(err)
@@ -360,14 +377,10 @@ func TestClaudeScanner_Scan(t *testing.T) {
 				})
 				encoded := encodeCwd(cwd)
 				writeConversationJSONL(t, homeDir, encoded, sid, []jsonlMessage{
-					{Role: "user", Timestamp: recentTimestamp.Add(-3 * time.Second),
-						Usage: &usage{InputTokens: 100, OutputTokens: 0}},
-					{Role: "assistant", Timestamp: recentTimestamp.Add(-2 * time.Second),
-						Usage: &usage{InputTokens: 0, OutputTokens: 500}},
-					{Role: "user", Timestamp: recentTimestamp.Add(-1 * time.Second),
-						Usage: &usage{InputTokens: 200, OutputTokens: 0}},
-					{Role: "assistant", Timestamp: recentTimestamp,
-						Usage: &usage{InputTokens: 0, OutputTokens: 800}},
+					mkMsg("user", recentTimestamp.Add(-3*time.Second), &usage{InputTokens: 100, OutputTokens: 0}),
+					mkMsg("assistant", recentTimestamp.Add(-2*time.Second), &usage{InputTokens: 0, OutputTokens: 500}),
+					mkMsg("user", recentTimestamp.Add(-1*time.Second), &usage{InputTokens: 200, OutputTokens: 0}),
+					mkMsg("assistant", recentTimestamp, &usage{InputTokens: 0, OutputTokens: 800}),
 				})
 			},
 			wants: wants{
@@ -410,14 +423,14 @@ func TestClaudeScanner_Scan(t *testing.T) {
 				}
 				defer f.Close()
 				// Valid line
-				validMsg := jsonlMessage{Role: "user", Timestamp: staleTimestamp, Message: "hello", Usage: &usage{InputTokens: 100, OutputTokens: 0}}
+				validMsg := mkMsg("user", staleTimestamp, &usage{InputTokens: 100, OutputTokens: 0})
 				validData, _ := json.Marshal(validMsg)
 				f.Write(validData)
 				f.WriteString("\n")
 				// Malformed line
 				f.WriteString("{this is not valid json\n")
 				// Another valid line
-				validMsg2 := jsonlMessage{Role: "assistant", Timestamp: staleTimestamp.Add(time.Second), Message: "hi", Usage: &usage{InputTokens: 0, OutputTokens: 200}}
+				validMsg2 := mkMsg("assistant", staleTimestamp.Add(time.Second), &usage{InputTokens: 0, OutputTokens: 200})
 				validData2, _ := json.Marshal(validMsg2)
 				f.Write(validData2)
 				f.WriteString("\n")
@@ -576,7 +589,7 @@ func TestClaudeScanner_StatusDetermination(t *testing.T) {
 		"alive_pid_recent_user_msg_is_active": {
 			buildFS: func(t *testing.T, homeDir string) {
 				makeSession(t, homeDir, "active", alivePID, []jsonlMessage{
-					{Role: "user", Timestamp: now.Add(-5 * time.Second), Message: "do it"},
+					mkMsg("user", now.Add(-5*time.Second), nil),
 				})
 			},
 			status: model.StatusActive,
@@ -584,7 +597,7 @@ func TestClaudeScanner_StatusDetermination(t *testing.T) {
 		"alive_pid_stale_msg_is_idle": {
 			buildFS: func(t *testing.T, homeDir string) {
 				makeSession(t, homeDir, "idle", alivePID, []jsonlMessage{
-					{Role: "user", Timestamp: now.Add(-5 * time.Minute), Message: "old msg"},
+					mkMsg("user", now.Add(-5*time.Minute), nil),
 				})
 			},
 			status: model.StatusIdle,
@@ -592,8 +605,8 @@ func TestClaudeScanner_StatusDetermination(t *testing.T) {
 		"alive_pid_last_msg_assistant_is_waiting": {
 			buildFS: func(t *testing.T, homeDir string) {
 				makeSession(t, homeDir, "waiting", alivePID, []jsonlMessage{
-					{Role: "user", Timestamp: now.Add(-30 * time.Second), Message: "do something"},
-					{Role: "assistant", Timestamp: now.Add(-10 * time.Second), Message: "done, what next?"},
+					mkMsg("user", now.Add(-30*time.Second), nil),
+					mkMsg("assistant", now.Add(-10*time.Second), nil),
 				})
 			},
 			status: model.StatusWaiting,
@@ -668,12 +681,7 @@ func TestClaudeScanner_TailParsing(t *testing.T) {
 				if i%2 == 1 {
 					role = "assistant"
 				}
-				messages[i] = jsonlMessage{
-					Role:      role,
-					Timestamp: startedAt.Add(time.Duration(i) * time.Second),
-					Message:   fmt.Sprintf("msg %d", i),
-					Usage:     &usage{InputTokens: 10, OutputTokens: 20},
-				}
+				messages[i] = mkMsg(role, startedAt.Add(time.Duration(i)*time.Second), &usage{InputTokens: 10, OutputTokens: 20})
 			}
 
 			encoded := encodeCwd(cwd)
@@ -702,22 +710,22 @@ func TestClaudeScanner_SlugTitle(t *testing.T) {
 	}{
 		"slug_present_on_message": {
 			messages: []jsonlMessage{
-				{Role: "user", Timestamp: startedAt.Add(time.Minute), Message: "hello", Slug: "fix-auth-bug"},
-				{Role: "assistant", Timestamp: startedAt.Add(2 * time.Minute), Message: "sure"},
+				mkMsgSlug("user", startedAt.Add(time.Minute), nil, "fix-auth-bug"),
+				mkMsg("assistant", startedAt.Add(2*time.Minute), nil),
 			},
 			wantTitle: "fix-auth-bug",
 		},
 		"last_slug_wins": {
 			messages: []jsonlMessage{
-				{Role: "user", Timestamp: startedAt.Add(time.Minute), Message: "hello", Slug: "initial-title"},
-				{Role: "assistant", Timestamp: startedAt.Add(2 * time.Minute), Message: "ok", Slug: "updated-title"},
+				mkMsgSlug("user", startedAt.Add(time.Minute), nil, "initial-title"),
+				mkMsgSlug("assistant", startedAt.Add(2*time.Minute), nil, "updated-title"),
 			},
 			wantTitle: "updated-title",
 		},
 		"no_slug_means_empty_title": {
 			messages: []jsonlMessage{
-				{Role: "user", Timestamp: startedAt.Add(time.Minute), Message: "hello"},
-				{Role: "assistant", Timestamp: startedAt.Add(2 * time.Minute), Message: "ok"},
+				mkMsg("user", startedAt.Add(time.Minute), nil),
+				mkMsg("assistant", startedAt.Add(2*time.Minute), nil),
 			},
 			wantTitle: "",
 		},
@@ -748,16 +756,15 @@ func TestClaudeScanner_SlugTitle(t *testing.T) {
 }
 
 // TestClaudeScanner_EncodedCwdPath verifies that the scanner correctly encodes
-// the cwd path to find the projects directory. Uses url.PathEscape which encodes
-// / as %2F, spaces as %20, and other special characters per RFC 3986.
+// the cwd path to find the projects directory. Claude Code replaces "/" with "-".
 func TestClaudeScanner_EncodedCwdPath(t *testing.T) {
 	startedAt := time.Now().UTC().Add(-1 * time.Hour).Truncate(time.Second)
 	const wantMsgCount = 2
 
 	tests := map[string]string{
-		"simple_path":       "/home/user/project",
-		"path_with_spaces":  "/home/user/my project",
-		"root_path":         "/",
+		"simple_path":        "/home/user/project",
+		"path_with_spaces":   "/home/user/my project",
+		"root_path":          "/",
 		"deeply_nested_path": "/a/b/c/d/e/f/g",
 	}
 
@@ -775,8 +782,8 @@ func TestClaudeScanner_EncodedCwdPath(t *testing.T) {
 
 			encoded := encodeCwd(cwd)
 			writeConversationJSONL(t, homeDir, encoded, sid, []jsonlMessage{
-				{Role: "user", Timestamp: startedAt.Add(1 * time.Minute), Message: "hi"},
-				{Role: "assistant", Timestamp: startedAt.Add(2 * time.Minute), Message: "hello"},
+				mkMsg("user", startedAt.Add(1*time.Minute), nil),
+				mkMsg("assistant", startedAt.Add(2*time.Minute), nil),
 			})
 
 			s := scanSingle(t, homeDir)

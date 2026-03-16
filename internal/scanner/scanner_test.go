@@ -101,7 +101,7 @@ func TestScanner_Scan_SortedByLastActiveDesc(t *testing.T) {
 		})
 		encoded := encodeCwd(cwds[i])
 		writeConversationJSONL(t, homeDir, encoded, sids[i], []jsonlMessage{
-			{Role: "user", Timestamp: now.Add(lastActives[i]), Message: "msg"},
+			mkMsg("user", now.Add(lastActives[i]), nil),
 		})
 	}
 
