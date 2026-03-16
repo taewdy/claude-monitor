@@ -96,7 +96,7 @@ func assertCodexSession(t *testing.T, idx int, got, want model.SessionInfo) {
 	}
 }
 
-// writeSessionIndexJSONL writes a session_index.jsonl file.
+// writeSessionIndexJSONL writes a session_index.jsonl file in the real Codex format.
 func writeSessionIndexJSONL(t *testing.T, homeDir string, entries []sessionIndexEntry) {
 	t.Helper()
 	dir := filepath.Join(homeDir, ".codex")
@@ -110,35 +110,62 @@ func writeSessionIndexJSONL(t *testing.T, homeDir string, entries []sessionIndex
 	defer f.Close()
 	enc := json.NewEncoder(f)
 	for _, e := range entries {
-		if err := enc.Encode(e); err != nil {
+		// Write in the real Codex format: thread_name and ISO updated_at.
+		raw := map[string]string{
+			"id":          e.ID,
+			"thread_name": e.Title,
+			"updated_at":  e.UpdatedAt.Format(time.RFC3339Nano),
+		}
+		if err := enc.Encode(raw); err != nil {
 			t.Fatal(err)
 		}
 	}
 }
 
-// writeRolloutJSONL writes a rollout JSONL file with the given timestamps.
-func writeRolloutJSONL(t *testing.T, path string, timestamps []int64) {
+// writeRolloutFile writes a rollout JSONL file with a session_meta entry and
+// optional additional event lines. Sets file mtime to the given time.
+func writeRolloutFile(t *testing.T, homeDir, sessionID, cwd, gitBranch string, startedAt, mtime time.Time) string {
 	t.Helper()
-	dir := filepath.Dir(path)
+	dir := filepath.Join(homeDir, ".codex", "sessions",
+		startedAt.Format("2006"), startedAt.Format("01"), startedAt.Format("02"))
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	f, err := os.Create(path)
+	filename := fmt.Sprintf("rollout-%s-%s.jsonl",
+		startedAt.Format("2006-01-02T15-04-05"), sessionID)
+	path := filepath.Join(dir, filename)
+
+	meta := map[string]interface{}{
+		"type":      "session_meta",
+		"timestamp": startedAt.Format(time.RFC3339Nano),
+		"payload": map[string]interface{}{
+			"id":        sessionID,
+			"cwd":       cwd,
+			"source":    "cli",
+			"timestamp": startedAt.Format(time.RFC3339Nano),
+			"git": map[string]string{
+				"branch": gitBranch,
+			},
+		},
+	}
+	data, err := json.Marshal(meta)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
-	enc := json.NewEncoder(f)
-	for _, ts := range timestamps {
-		if err := enc.Encode(map[string]int64{"timestamp": ts}); err != nil {
-			t.Fatal(err)
-		}
+	data = append(data, '\n')
+
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
 	}
+	if err := os.Chtimes(path, mtime, mtime); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }
 
-// ---------- scan() tests ----------
+// ---------- scan() tests with DB ----------
 
-func TestCodexScanner_Scan(t *testing.T) {
+func TestCodexScanner_ScanFromDB(t *testing.T) {
 	now := time.Now().Unix()
 
 	tests := map[string]struct {
@@ -148,7 +175,6 @@ func TestCodexScanner_Scan(t *testing.T) {
 		wantErr  bool
 	}{
 		"no_codex_directory": {
-			// ~/.codex doesn't exist → return empty slice, no error.
 			count: 0,
 		},
 		"empty_database_no_threads": {
@@ -158,7 +184,6 @@ func TestCodexScanner_Scan(t *testing.T) {
 			count: 0,
 		},
 		"single_active_thread": {
-			// updated_at < 60s ago → active
 			buildFS: func(t *testing.T, homeDir string) {
 				createCodexDB(t, homeDir, []threadRow{
 					{
@@ -166,7 +191,7 @@ func TestCodexScanner_Scan(t *testing.T) {
 						Title:      "Fix auth flow",
 						Cwd:        "/home/user/project",
 						TokensUsed: 5000,
-						UpdatedAt:  now - 10, // 10 seconds ago
+						UpdatedAt:  now - 10,
 						GitBranch:  "feat/auth",
 						Source:     "cli",
 					},
@@ -185,7 +210,6 @@ func TestCodexScanner_Scan(t *testing.T) {
 			},
 		},
 		"single_idle_thread": {
-			// updated_at > 60s but < 10min → idle
 			buildFS: func(t *testing.T, homeDir string) {
 				createCodexDB(t, homeDir, []threadRow{
 					{
@@ -193,7 +217,7 @@ func TestCodexScanner_Scan(t *testing.T) {
 						Title:      "Refactor DB layer",
 						Cwd:        "/home/user/backend",
 						TokensUsed: 8000,
-						UpdatedAt:  now - 300, // 5 minutes ago
+						UpdatedAt:  now - 300,
 						GitBranch:  "refactor/db",
 						Source:     "cli",
 					},
@@ -212,7 +236,6 @@ func TestCodexScanner_Scan(t *testing.T) {
 			},
 		},
 		"single_finished_thread": {
-			// updated_at > 10min → finished
 			buildFS: func(t *testing.T, homeDir string) {
 				createCodexDB(t, homeDir, []threadRow{
 					{
@@ -220,7 +243,7 @@ func TestCodexScanner_Scan(t *testing.T) {
 						Title:      "Old task",
 						Cwd:        "/home/user/legacy",
 						TokensUsed: 12000,
-						UpdatedAt:  now - 3600, // 1 hour ago
+						UpdatedAt:  now - 3600,
 						GitBranch:  "main",
 						Source:     "cli",
 					},
@@ -250,31 +273,6 @@ func TestCodexScanner_Scan(t *testing.T) {
 			},
 			count: 1,
 		},
-		"multiple_threads_with_different_statuses": {
-			buildFS: func(t *testing.T, homeDir string) {
-				createCodexDB(t, homeDir, []threadRow{
-					{ID: "t-active", Title: "Active", Cwd: "/proj/a", TokensUsed: 100, UpdatedAt: now - 10},
-					{ID: "t-idle", Title: "Idle", Cwd: "/proj/b", TokensUsed: 200, UpdatedAt: now - 300},
-					{ID: "t-done", Title: "Done", Cwd: "/proj/c", TokensUsed: 300, UpdatedAt: now - 3600},
-				})
-			},
-			count: 3,
-		},
-		"corrupt_database_file": {
-			buildFS: func(t *testing.T, homeDir string) {
-				dir := filepath.Join(homeDir, ".codex")
-				if err := os.MkdirAll(dir, 0o755); err != nil {
-					t.Fatal(err)
-				}
-				// Write garbage bytes as the database.
-				if err := os.WriteFile(filepath.Join(dir, "state_5.sqlite"), []byte("not a database"), 0o644); err != nil {
-					t.Fatal(err)
-				}
-			},
-			// Implementation should handle gracefully — either return error or empty.
-			// The key contract: no panic.
-			wantErr: true,
-		},
 		"thread_with_empty_fields": {
 			buildFS: func(t *testing.T, homeDir string) {
 				createCodexDB(t, homeDir, []threadRow{
@@ -293,6 +291,18 @@ func TestCodexScanner_Scan(t *testing.T) {
 					Status:   model.StatusActive,
 				},
 			},
+		},
+		"corrupt_database_file": {
+			buildFS: func(t *testing.T, homeDir string) {
+				dir := filepath.Join(homeDir, ".codex")
+				if err := os.MkdirAll(dir, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(dir, "state_5.sqlite"), []byte("not a database"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantErr: true,
 		},
 	}
 
@@ -333,6 +343,170 @@ func TestCodexScanner_Scan(t *testing.T) {
 	}
 }
 
+// ---------- Rollout file fallback tests ----------
+
+func TestCodexScanner_ScanFromRolloutFiles(t *testing.T) {
+	now := time.Now()
+
+	t.Run("discovers_sessions_from_rollout_files", func(t *testing.T) {
+		homeDir := t.TempDir()
+
+		// Create rollout files with different mtimes.
+		writeRolloutFile(t, homeDir, "sess-recent", "/proj/a", "main",
+			now.Add(-1*time.Hour), now.Add(-30*time.Second))
+		writeRolloutFile(t, homeDir, "sess-old", "/proj/b", "dev",
+			now.Add(-2*time.Hour), now.Add(-1*time.Hour))
+
+		cs := newCodexScanner(homeDir)
+		got, err := cs.scan(context.Background())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(got) != 2 {
+			t.Fatalf("expected 2 sessions, got %d: %+v", len(got), got)
+		}
+		// Most recent first.
+		if got[0].ID != "sess-recent" {
+			t.Errorf("first session ID = %q, want %q", got[0].ID, "sess-recent")
+		}
+		if got[0].ProjectDir != "/proj/a" {
+			t.Errorf("ProjectDir = %q, want %q", got[0].ProjectDir, "/proj/a")
+		}
+		if got[0].GitBranch != "main" {
+			t.Errorf("GitBranch = %q, want %q", got[0].GitBranch, "main")
+		}
+	})
+
+	t.Run("rollout_with_session_index_title", func(t *testing.T) {
+		homeDir := t.TempDir()
+
+		writeRolloutFile(t, homeDir, "sess-titled", "/proj", "main",
+			now.Add(-1*time.Hour), now.Add(-5*time.Minute))
+		writeSessionIndexJSONL(t, homeDir, []sessionIndexEntry{
+			{ID: "sess-titled", Title: "My Task", UpdatedAt: now.Add(-5 * time.Minute)},
+		})
+
+		cs := newCodexScanner(homeDir)
+		got, err := cs.scan(context.Background())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(got) != 1 {
+			t.Fatalf("expected 1 session, got %d", len(got))
+		}
+		if got[0].Title != "My Task" {
+			t.Errorf("Title = %q, want %q", got[0].Title, "My Task")
+		}
+	})
+
+	t.Run("status_from_file_mtime", func(t *testing.T) {
+		homeDir := t.TempDir()
+
+		// Active: mtime < 60s
+		writeRolloutFile(t, homeDir, "s-active", "/proj", "",
+			now.Add(-1*time.Hour), now.Add(-10*time.Second))
+		// Idle: mtime 60s-10min
+		writeRolloutFile(t, homeDir, "s-idle", "/proj", "",
+			now.Add(-2*time.Hour), now.Add(-5*time.Minute))
+		// Finished: mtime > 10min
+		writeRolloutFile(t, homeDir, "s-done", "/proj", "",
+			now.Add(-3*time.Hour), now.Add(-1*time.Hour))
+
+		cs := newCodexScanner(homeDir)
+		got, err := cs.scan(context.Background())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(got) != 3 {
+			t.Fatalf("expected 3 sessions, got %d", len(got))
+		}
+
+		statusByID := map[string]model.Status{}
+		for _, s := range got {
+			statusByID[s.ID] = s.Status
+		}
+		if statusByID["s-active"] != model.StatusActive {
+			t.Errorf("s-active status = %q, want active", statusByID["s-active"])
+		}
+		if statusByID["s-idle"] != model.StatusIdle {
+			t.Errorf("s-idle status = %q, want idle", statusByID["s-idle"])
+		}
+		if statusByID["s-done"] != model.StatusFinished {
+			t.Errorf("s-done status = %q, want finished", statusByID["s-done"])
+		}
+	})
+
+	t.Run("empty_db_falls_through_to_rollout", func(t *testing.T) {
+		homeDir := t.TempDir()
+
+		// Create empty DB AND rollout files — should use rollout fallback.
+		createCodexDB(t, homeDir, nil)
+		writeRolloutFile(t, homeDir, "fallback-sess", "/proj", "main",
+			now.Add(-1*time.Hour), now.Add(-30*time.Second))
+
+		cs := newCodexScanner(homeDir)
+		got, err := cs.scan(context.Background())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(got) != 1 {
+			t.Fatalf("expected 1 session, got %d", len(got))
+		}
+		if got[0].ID != "fallback-sess" {
+			t.Errorf("ID = %q, want %q", got[0].ID, "fallback-sess")
+		}
+	})
+
+	t.Run("no_sessions_dir_returns_empty", func(t *testing.T) {
+		homeDir := t.TempDir()
+		// Create .codex with empty DB but no sessions dir.
+		createCodexDB(t, homeDir, nil)
+
+		cs := newCodexScanner(homeDir)
+		got, err := cs.scan(context.Background())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(got) != 0 {
+			t.Fatalf("expected 0 sessions, got %d", len(got))
+		}
+	})
+
+	t.Run("limits_to_50_sessions", func(t *testing.T) {
+		homeDir := t.TempDir()
+		for i := 0; i < 60; i++ {
+			sid := fmt.Sprintf("sess-%03d", i)
+			writeRolloutFile(t, homeDir, sid, "/proj", "",
+				now.Add(-time.Duration(i)*time.Hour),
+				now.Add(-time.Duration(i)*time.Minute))
+		}
+
+		cs := newCodexScanner(homeDir)
+		got, err := cs.scan(context.Background())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(got) != 50 {
+			t.Fatalf("expected 50 sessions (limit), got %d", len(got))
+		}
+	})
+
+	t.Run("context_cancellation", func(t *testing.T) {
+		homeDir := t.TempDir()
+		writeRolloutFile(t, homeDir, "sess-cancel", "/proj", "",
+			now.Add(-1*time.Hour), now)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		cs := newCodexScanner(homeDir)
+		_, err := cs.scan(ctx)
+		if err == nil {
+			t.Fatal("expected error from cancelled context")
+		}
+	})
+}
+
 // ---------- Status boundary tests ----------
 
 func TestCodexScanner_StatusBoundaries(t *testing.T) {
@@ -351,7 +525,6 @@ func TestCodexScanner_StatusBoundaries(t *testing.T) {
 			want:      model.StatusActive,
 		},
 		"60_seconds_ago_is_idle": {
-			// Boundary: exactly 60s should transition to idle.
 			updatedAt: now - 60,
 			want:      model.StatusIdle,
 		},
@@ -364,7 +537,6 @@ func TestCodexScanner_StatusBoundaries(t *testing.T) {
 			want:      model.StatusIdle,
 		},
 		"600_seconds_ago_is_finished": {
-			// Boundary: exactly 10min should transition to finished.
 			updatedAt: now - 600,
 			want:      model.StatusFinished,
 		},
@@ -405,7 +577,6 @@ func TestCodexScanner_OpenDB(t *testing.T) {
 		wantErr bool
 	}{
 		"missing_codex_dir": {
-			// No .codex directory → should return error.
 			wantErr: true,
 		},
 		"missing_db_file": {
@@ -414,7 +585,6 @@ func TestCodexScanner_OpenDB(t *testing.T) {
 					t.Fatal(err)
 				}
 			},
-			// Directory exists but no DB file → should return error.
 			wantErr: true,
 		},
 		"valid_db": {
@@ -437,7 +607,6 @@ func TestCodexScanner_OpenDB(t *testing.T) {
 
 			if tt.wantErr {
 				if err == nil && db != nil {
-					// openDB might succeed lazily with sqlite; try a query.
 					_, queryErr := db.Exec("SELECT 1")
 					if queryErr == nil {
 						t.Error("expected error opening DB, but query succeeded")
@@ -455,7 +624,6 @@ func TestCodexScanner_OpenDB(t *testing.T) {
 			}
 			defer db.Close()
 
-			// Verify we can query.
 			var n int
 			if err := db.QueryRow("SELECT 1").Scan(&n); err != nil {
 				t.Fatalf("DB not queryable: %v", err)
@@ -470,9 +638,8 @@ func TestCodexScanner_QueryThreads(t *testing.T) {
 	now := time.Now().Unix()
 
 	tests := map[string]struct {
-		rows    []threadRow
-		want    int // expected number of returned rows
-		wantErr bool
+		rows []threadRow
+		want int
 	}{
 		"empty_table": {
 			rows: nil,
@@ -503,7 +670,7 @@ func TestCodexScanner_QueryThreads(t *testing.T) {
 				}
 				return rows
 			}(),
-			want: 50, // LIMIT 50 in the query
+			want: 50,
 		},
 	}
 
@@ -512,7 +679,6 @@ func TestCodexScanner_QueryThreads(t *testing.T) {
 			homeDir := t.TempDir()
 			createCodexDB(t, homeDir, tt.rows)
 
-			// Open DB directly (bypassing stub openDB) so we can test queryThreads in isolation.
 			dbPath := filepath.Join(homeDir, ".codex", "state_5.sqlite")
 			db, err := sql.Open("sqlite", dbPath+"?mode=ro")
 			if err != nil {
@@ -522,12 +688,6 @@ func TestCodexScanner_QueryThreads(t *testing.T) {
 
 			cs := newCodexScanner(homeDir)
 			got, err := cs.queryThreads(context.Background(), db)
-			if tt.wantErr {
-				if err == nil {
-					t.Fatal("expected error, got nil")
-				}
-				return
-			}
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -535,7 +695,6 @@ func TestCodexScanner_QueryThreads(t *testing.T) {
 				t.Fatalf("expected %d rows, got %d", tt.want, len(got))
 			}
 
-			// Verify ordering: first row should have highest updated_at.
 			if len(got) > 1 {
 				for i := 1; i < len(got); i++ {
 					if got[i].UpdatedAt > got[i-1].UpdatedAt {
@@ -553,12 +712,10 @@ func TestCodexScanner_QueryThreads(t *testing.T) {
 func TestCodexScanner_ReadSessionIndex(t *testing.T) {
 	tests := map[string]struct {
 		buildFS  func(t *testing.T, homeDir string)
-		want     int // expected map size
+		want     int
 		wantKeys []string
-		wantErr  bool
 	}{
 		"missing_file_returns_empty": {
-			// No session_index.jsonl → empty map, no error.
 			want: 0,
 		},
 		"empty_file": {
@@ -576,7 +733,7 @@ func TestCodexScanner_ReadSessionIndex(t *testing.T) {
 		"single_entry": {
 			buildFS: func(t *testing.T, homeDir string) {
 				writeSessionIndexJSONL(t, homeDir, []sessionIndexEntry{
-					{ID: "idx-1", Title: "Session One", UpdatedAt: 1700000000},
+					{ID: "idx-1", Title: "Session One", UpdatedAt: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)},
 				})
 			},
 			want: 1,
@@ -584,9 +741,9 @@ func TestCodexScanner_ReadSessionIndex(t *testing.T) {
 		"multiple_entries": {
 			buildFS: func(t *testing.T, homeDir string) {
 				writeSessionIndexJSONL(t, homeDir, []sessionIndexEntry{
-					{ID: "idx-1", Title: "Session One", UpdatedAt: 1700000000},
-					{ID: "idx-2", Title: "Session Two", UpdatedAt: 1700001000},
-					{ID: "idx-3", Title: "Session Three", UpdatedAt: 1700002000},
+					{ID: "idx-1", Title: "Session One", UpdatedAt: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)},
+					{ID: "idx-2", Title: "Session Two", UpdatedAt: time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)},
+					{ID: "idx-3", Title: "Session Three", UpdatedAt: time.Date(2026, 1, 3, 0, 0, 0, 0, time.UTC)},
 				})
 			},
 			want: 3,
@@ -597,15 +754,14 @@ func TestCodexScanner_ReadSessionIndex(t *testing.T) {
 				if err := os.MkdirAll(dir, 0o755); err != nil {
 					t.Fatal(err)
 				}
-				content := `{"id":"good","title":"Good","updated_at":100}
+				content := `{"id":"good","thread_name":"Good","updated_at":"2026-01-01T00:00:00Z"}
 {bad json line
-{"id":"also-good","title":"Also Good","updated_at":200}
+{"id":"also-good","thread_name":"Also Good","updated_at":"2026-01-02T00:00:00Z"}
 `
 				if err := os.WriteFile(filepath.Join(dir, "session_index.jsonl"), []byte(content), 0o644); err != nil {
 					t.Fatal(err)
 				}
 			},
-			// Should skip bad lines, keep good ones.
 			want:     2,
 			wantKeys: []string{"good", "also-good"},
 		},
@@ -620,13 +776,6 @@ func TestCodexScanner_ReadSessionIndex(t *testing.T) {
 
 			cs := newCodexScanner(homeDir)
 			got, err := cs.readSessionIndex()
-
-			if tt.wantErr {
-				if err == nil {
-					t.Fatal("expected error, got nil")
-				}
-				return
-			}
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -635,167 +784,72 @@ func TestCodexScanner_ReadSessionIndex(t *testing.T) {
 			}
 			for _, key := range tt.wantKeys {
 				if _, ok := got[key]; !ok {
-					t.Errorf("expected key %q in map, got keys: %v", key, mapKeys(got))
+					t.Errorf("expected key %q in map", key)
 				}
 			}
 		})
 	}
 }
 
-// mapKeys returns the keys of a map for diagnostic output.
-func mapKeys(m map[string]sessionIndexEntry) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	return keys
-}
+// ---------- parseRolloutMeta tests ----------
 
-// ---------- checkRolloutTimestamp tests ----------
+func TestCodexScanner_ParseRolloutMeta(t *testing.T) {
+	now := time.Now()
 
-func TestCodexScanner_CheckRolloutTimestamp(t *testing.T) {
-	tests := map[string]struct {
-		buildFS       func(t *testing.T, homeDir string) string // returns rollout path
-		wantTimestamp int64
-		wantErr       bool
-	}{
-		"missing_rollout_file": {
-			buildFS: func(t *testing.T, homeDir string) string {
-				return filepath.Join(homeDir, "nonexistent", "rollout.jsonl")
-			},
-			wantTimestamp: 0,
-		},
-		"empty_rollout_file": {
-			buildFS: func(t *testing.T, homeDir string) string {
-				path := filepath.Join(homeDir, "rollout.jsonl")
-				if err := os.WriteFile(path, []byte(""), 0o644); err != nil {
-					t.Fatal(err)
-				}
-				return path
-			},
-			wantTimestamp: 0,
-		},
-		"single_event": {
-			buildFS: func(t *testing.T, homeDir string) string {
-				path := filepath.Join(homeDir, "rollout.jsonl")
-				writeRolloutJSONL(t, path, []int64{1700000000})
-				return path
-			},
-			wantTimestamp: 1700000000,
-		},
-		"multiple_events_returns_last": {
-			buildFS: func(t *testing.T, homeDir string) string {
-				path := filepath.Join(homeDir, "rollout.jsonl")
-				writeRolloutJSONL(t, path, []int64{1700000000, 1700001000, 1700002000})
-				return path
-			},
-			wantTimestamp: 1700002000,
-		},
-		"malformed_rollout_lines": {
-			buildFS: func(t *testing.T, homeDir string) string {
-				path := filepath.Join(homeDir, "rollout.jsonl")
-				content := `{"timestamp":1700000000}
-{not valid json}
-{"timestamp":1700005000}
-`
-				if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-					t.Fatal(err)
-				}
-				return path
-			},
-			wantTimestamp: 1700005000,
-		},
-	}
-
-	for name, tt := range tests {
-		t.Run(name, func(t *testing.T) {
-			homeDir := t.TempDir()
-			rolloutPath := tt.buildFS(t, homeDir)
-
-			cs := newCodexScanner(homeDir)
-			got, err := cs.checkRolloutTimestamp(rolloutPath)
-
-			if tt.wantErr {
-				if err == nil {
-					t.Fatal("expected error, got nil")
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-			if got != tt.wantTimestamp {
-				t.Errorf("timestamp = %d, want %d", got, tt.wantTimestamp)
-			}
-		})
-	}
-}
-
-// ---------- Integration: scan with rollout and session index ----------
-
-func TestCodexScanner_ScanWithRolloutAndIndex(t *testing.T) {
-	now := time.Now().Unix()
-
-	t.Run("rollout_timestamp_used_for_recent_threads", func(t *testing.T) {
+	t.Run("valid_session_meta", func(t *testing.T) {
 		homeDir := t.TempDir()
-
-		rolloutPath := filepath.Join(homeDir, ".codex", "rollouts", "thread-roll.jsonl")
-		writeRolloutJSONL(t, rolloutPath, []int64{now - 5}) // 5 seconds ago
-
-		createCodexDB(t, homeDir, []threadRow{
-			{
-				ID:          "thread-roll",
-				Title:       "With Rollout",
-				Cwd:         "/proj",
-				TokensUsed:  100,
-				UpdatedAt:   now - 30, // 30s ago in DB
-				RolloutPath: rolloutPath,
-			},
-		})
+		path := writeRolloutFile(t, homeDir, "test-id", "/proj/test", "feat/foo",
+			now.Add(-1*time.Hour), now)
 
 		cs := newCodexScanner(homeDir)
-		got, err := cs.scan(context.Background())
+		meta, err := cs.parseRolloutMeta(path)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if len(got) != 1 {
-			t.Fatalf("expected 1 session, got %d", len(got))
+		if meta.ID != "test-id" {
+			t.Errorf("ID = %q, want %q", meta.ID, "test-id")
 		}
-		// The rollout timestamp (5s ago) is more recent than updated_at (30s ago),
-		// so if the implementation uses rollout timestamps, the session could be active.
-		// This test verifies that rollout is checked at all.
-		if got[0].ID != "thread-roll" {
-			t.Errorf("ID = %q, want %q", got[0].ID, "thread-roll")
+		if meta.Cwd != "/proj/test" {
+			t.Errorf("Cwd = %q, want %q", meta.Cwd, "/proj/test")
+		}
+		if meta.GitBranch != "feat/foo" {
+			t.Errorf("GitBranch = %q, want %q", meta.GitBranch, "feat/foo")
 		}
 	})
 
-	t.Run("session_index_provides_metadata", func(t *testing.T) {
+	t.Run("missing_file", func(t *testing.T) {
+		cs := newCodexScanner(t.TempDir())
+		_, err := cs.parseRolloutMeta("/nonexistent/rollout.jsonl")
+		if err == nil {
+			t.Fatal("expected error for missing file")
+		}
+	})
+
+	t.Run("empty_file", func(t *testing.T) {
 		homeDir := t.TempDir()
-
-		createCodexDB(t, homeDir, []threadRow{
-			{
-				ID:        "thread-idx",
-				Title:     "DB Title",
-				Cwd:       "/proj",
-				UpdatedAt: now - 10,
-			},
-		})
-
-		writeSessionIndexJSONL(t, homeDir, []sessionIndexEntry{
-			{ID: "thread-idx", Title: "Index Title", UpdatedAt: now - 5},
-		})
+		path := filepath.Join(homeDir, "empty.jsonl")
+		if err := os.WriteFile(path, []byte(""), 0o644); err != nil {
+			t.Fatal(err)
+		}
 
 		cs := newCodexScanner(homeDir)
-		got, err := cs.scan(context.Background())
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
+		_, err := cs.parseRolloutMeta(path)
+		if err == nil {
+			t.Fatal("expected error for empty file")
 		}
-		if len(got) != 1 {
-			t.Fatalf("expected 1 session, got %d", len(got))
+	})
+
+	t.Run("non_session_meta_first_line", func(t *testing.T) {
+		homeDir := t.TempDir()
+		path := filepath.Join(homeDir, "bad.jsonl")
+		if err := os.WriteFile(path, []byte(`{"type":"event_msg","timestamp":"2026-01-01T00:00:00Z"}`+"\n"), 0o644); err != nil {
+			t.Fatal(err)
 		}
-		// Verify session was found; specific metadata merging depends on implementation.
-		if got[0].ID != "thread-idx" {
-			t.Errorf("ID = %q, want %q", got[0].ID, "thread-idx")
+
+		cs := newCodexScanner(homeDir)
+		_, err := cs.parseRolloutMeta(path)
+		if err == nil {
+			t.Fatal("expected error for non-session_meta first line")
 		}
 	})
 }

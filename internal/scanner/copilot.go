@@ -10,14 +10,16 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/universe/claude-monitor/internal/model"
 )
 
-// copilotScanner discovers GitHub Copilot CLI sessions by reading
-// workspace.yaml, events.jsonl, and IDE lock files from ~/.copilot/.
+// copilotScanner discovers GitHub Copilot sessions (both VSCode agent mode
+// and standalone CLI) by reading workspace.yaml, events.jsonl, and lock
+// files from ~/.copilot/.
 type copilotScanner struct {
 	// homeDir is the user's home directory, injected for testability.
 	homeDir string
@@ -28,7 +30,7 @@ func newCopilotScanner(homeDir string) *copilotScanner {
 	return &copilotScanner{homeDir: homeDir}
 }
 
-// scan discovers all GitHub Copilot CLI sessions and returns their info.
+// scan discovers all GitHub Copilot sessions and returns their info.
 func (c *copilotScanner) scan(ctx context.Context) ([]model.SessionInfo, error) {
 	sessionStateDir := filepath.Join(c.homeDir, ".copilot", "session-state")
 	entries, err := os.ReadDir(sessionStateDir)
@@ -108,7 +110,7 @@ func (c *copilotScanner) parseSession(sid string) (*model.SessionInfo, error) {
 	}
 
 	// Determine status
-	status := c.determineStatus(sid, hasShutdown, lastEventType, lastEventTime, len(events))
+	status := c.determineStatus(sid, hasShutdown, lastEventType, lastEventTime, len(events), ws.updatedAt)
 
 	// Copilot CLI does not expose token usage in its event stream,
 	// so InputTokens and OutputTokens are left at their zero values.
@@ -126,13 +128,24 @@ func (c *copilotScanner) parseSession(sid string) (*model.SessionInfo, error) {
 	return info, nil
 }
 
-// determineStatus resolves the session status based on events and IDE lock files.
-func (c *copilotScanner) determineStatus(sid string, hasShutdown bool, lastEventType string, lastEventTime time.Time, eventCount int) model.Status {
+// determineStatus resolves the session status based on events and lock files.
+// It handles both VSCode agent sessions (with events.jsonl) and CLI sessions
+// (which may lack events but use inuse.*.lock files).
+func (c *copilotScanner) determineStatus(sid string, hasShutdown bool, lastEventType string, lastEventTime time.Time, eventCount int, wsUpdatedAt time.Time) model.Status {
 	if hasShutdown {
 		return model.StatusFinished
 	}
 
+	// For sessions without events (typically CLI sessions), check lock files
+	// for liveness. If the workspace hasn't been updated in 10 minutes,
+	// treat it as idle even if the process lingers (daemon not cleaned up).
 	if eventCount == 0 {
+		if c.isSessionLockAlive(sid) || c.isIDELockAlive(sid) {
+			if time.Since(wsUpdatedAt) >= 10*time.Minute {
+				return model.StatusIdle
+			}
+			return model.StatusActive
+		}
 		return model.StatusFinished
 	}
 
@@ -140,8 +153,8 @@ func (c *copilotScanner) determineStatus(sid string, hasShutdown bool, lastEvent
 		return model.StatusWaiting
 	}
 
-	// Check IDE lock file
-	if c.isIDELockAlive(sid) {
+	// Check lock files (both IDE lock and in-session lock)
+	if c.isIDELockAlive(sid) || c.isSessionLockAlive(sid) {
 		return model.StatusActive
 	}
 
@@ -173,6 +186,27 @@ func (c *copilotScanner) isIDELockAlive(sid string) bool {
 	return isProcessAlive(lock.PID)
 }
 
+// isSessionLockAlive checks for an inuse.{PID}.lock file inside the session
+// directory (used by the Copilot CLI) and returns true if the PID is alive.
+func (c *copilotScanner) isSessionLockAlive(sid string) bool {
+	sessionDir := filepath.Join(c.homeDir, ".copilot", "session-state", sid)
+	entries, err := os.ReadDir(sessionDir)
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if strings.HasPrefix(name, "inuse.") && strings.HasSuffix(name, ".lock") {
+			pidStr := strings.TrimSuffix(strings.TrimPrefix(name, "inuse."), ".lock")
+			pid, err := strconv.Atoi(pidStr)
+			if err == nil && pid > 0 && isProcessAlive(pid) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // copilotWorkspace holds parsed fields from workspace.yaml.
 type copilotWorkspace struct {
 	id        string
@@ -202,9 +236,9 @@ func (c *copilotScanner) parseWorkspaceYAML(path string) (*copilotWorkspace, err
 			ws.id = value
 		case "cwd":
 			ws.cwd = value
-		case "git_branch":
+		case "branch", "git_branch":
 			ws.gitBranch = value
-		case "git_remote":
+		case "repository", "git_remote":
 			ws.gitRemote = value
 		case "created_at":
 			ws.createdAt, _ = time.Parse(time.RFC3339, value)

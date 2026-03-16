@@ -49,8 +49,8 @@ func writeWorkspaceYAML(t *testing.T, homeDir, sessionID string, ws workspaceYAM
 	}
 	content := fmt.Sprintf(`id: %s
 cwd: %s
-git_branch: %s
-git_remote: %s
+branch: %s
+repository: %s
 created_at: %s
 updated_at: %s
 summary: %s
@@ -100,6 +100,20 @@ func writeIDELockFile(t *testing.T, homeDir, sessionID string, lock ideLockFile)
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, sessionID+".lock"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// writeSessionLockFile writes an inuse.{PID}.lock file inside the session directory
+// (used by the Copilot CLI for liveness detection).
+func writeSessionLockFile(t *testing.T, homeDir, sessionID string, pid int) {
+	t.Helper()
+	dir := filepath.Join(homeDir, ".copilot", "session-state", sessionID)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	lockName := fmt.Sprintf("inuse.%d.lock", pid)
+	if err := os.WriteFile(filepath.Join(dir, lockName), []byte(fmt.Sprintf("%d", pid)), 0o644); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -350,7 +364,7 @@ func TestCopilotScanner_Scan(t *testing.T) {
 			count: 0,
 		},
 		"session_without_events_jsonl": {
-			// workspace.yaml exists but no events.jsonl → should still return session.
+			// workspace.yaml exists but no events.jsonl and no lock → finished.
 			buildFS: func(t *testing.T, homeDir string) {
 				sid := "no-events-uuid"
 				writeWorkspaceYAML(t, homeDir, sid, workspaceYAML{
@@ -363,10 +377,72 @@ func TestCopilotScanner_Scan(t *testing.T) {
 				{
 					ID:         "no-events-uuid",
 					Provider:   model.ProviderCopilot,
-					Status:     model.StatusFinished, // No events, can't determine active state.
+					Status:     model.StatusFinished,
 					Title:      "No events",
 					ProjectDir: "/proj",
 					GitBranch:  "main",
+				},
+			},
+		},
+		"cli_session_no_events_with_alive_lock_recent": {
+			// CLI session: no events.jsonl but inuse.*.lock with alive PID,
+			// workspace updated recently → active.
+			buildFS: func(t *testing.T, homeDir string) {
+				sid := "cli-active-uuid"
+				writeWorkspaceYAML(t, homeDir, sid, workspaceYAML{
+					ID: sid, Cwd: "/home/user/cli-proj", GitBranch: "main",
+					CreatedAt: now.Add(-5 * time.Minute), UpdatedAt: now.Add(-5 * time.Minute),
+					Summary: "",
+				})
+				writeSessionLockFile(t, homeDir, sid, os.Getpid())
+			},
+			sessions: []model.SessionInfo{
+				{
+					ID:         "cli-active-uuid",
+					Provider:   model.ProviderCopilot,
+					Status:     model.StatusActive,
+					ProjectDir: "/home/user/cli-proj",
+					GitBranch:  "main",
+				},
+			},
+		},
+		"cli_session_no_events_with_alive_lock_stale": {
+			// CLI session: no events.jsonl, inuse.*.lock with alive PID,
+			// but workspace updated >10 min ago → idle (lingering daemon).
+			buildFS: func(t *testing.T, homeDir string) {
+				sid := "cli-stale-uuid"
+				writeWorkspaceYAML(t, homeDir, sid, workspaceYAML{
+					ID: sid, Cwd: "/home/user/cli-proj", GitBranch: "main",
+					CreatedAt: now.Add(-1 * time.Hour), UpdatedAt: now.Add(-1 * time.Hour),
+				})
+				writeSessionLockFile(t, homeDir, sid, os.Getpid())
+			},
+			sessions: []model.SessionInfo{
+				{
+					ID:         "cli-stale-uuid",
+					Provider:   model.ProviderCopilot,
+					Status:     model.StatusIdle,
+					ProjectDir: "/home/user/cli-proj",
+					GitBranch:  "main",
+				},
+			},
+		},
+		"cli_session_no_events_with_dead_lock": {
+			// CLI session: no events.jsonl and inuse.*.lock with dead PID → finished.
+			buildFS: func(t *testing.T, homeDir string) {
+				sid := "cli-dead-uuid"
+				writeWorkspaceYAML(t, homeDir, sid, workspaceYAML{
+					ID: sid, Cwd: "/home/user/cli-proj",
+					CreatedAt: now.Add(-1 * time.Hour), UpdatedAt: now.Add(-1 * time.Hour),
+				})
+				writeSessionLockFile(t, homeDir, sid, 999999999)
+			},
+			sessions: []model.SessionInfo{
+				{
+					ID:         "cli-dead-uuid",
+					Provider:   model.ProviderCopilot,
+					Status:     model.StatusFinished,
+					ProjectDir: "/home/user/cli-proj",
 				},
 			},
 		},
@@ -582,6 +658,46 @@ func TestCopilotScanner_StatusDetermination(t *testing.T) {
 					PID:     999999999, // Dead PID.
 					IDEName: "vscode",
 				})
+			},
+			status: model.StatusIdle,
+		},
+		"session_lock_alive_pid_overrides_idle": {
+			// Stale event (would be idle) but inuse.*.lock with alive PID → active.
+			buildFS: func(t *testing.T, homeDir, sid string) {
+				writeEventsJSONL(t, homeDir, sid, []copilotEvent{
+					{Type: "assistant.message", Timestamp: now.Add(-5 * time.Minute).Unix()},
+				})
+				writeSessionLockFile(t, homeDir, sid, os.Getpid())
+			},
+			status: model.StatusActive,
+		},
+		"session_lock_dead_pid_no_override": {
+			// inuse.*.lock with dead PID → does not override idle.
+			buildFS: func(t *testing.T, homeDir, sid string) {
+				writeEventsJSONL(t, homeDir, sid, []copilotEvent{
+					{Type: "assistant.message", Timestamp: now.Add(-5 * time.Minute).Unix()},
+				})
+				writeSessionLockFile(t, homeDir, sid, 999999999)
+			},
+			status: model.StatusIdle,
+		},
+		"no_events_session_lock_alive_is_active": {
+			// No events at all, but inuse.*.lock with alive PID and recent workspace → active.
+			buildFS: func(t *testing.T, homeDir, sid string) {
+				writeSessionLockFile(t, homeDir, sid, os.Getpid())
+			},
+			status: model.StatusActive,
+		},
+		"no_events_session_lock_alive_stale_workspace_is_idle": {
+			// No events, alive PID, but workspace updated >10 min ago → idle.
+			buildFS: func(t *testing.T, homeDir, sid string) {
+				// Overwrite workspace.yaml with a stale updated_at.
+				writeWorkspaceYAML(t, homeDir, sid, workspaceYAML{
+					ID: sid, Cwd: "/proj", GitBranch: "main",
+					CreatedAt: now.Add(-1 * time.Hour), UpdatedAt: now.Add(-1 * time.Hour),
+					Summary: "Status test",
+				})
+				writeSessionLockFile(t, homeDir, sid, os.Getpid())
 			},
 			status: model.StatusIdle,
 		},
