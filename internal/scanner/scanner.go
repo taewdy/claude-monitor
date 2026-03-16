@@ -12,16 +12,18 @@ import (
 
 // Scanner aggregates results from all provider-specific scanners.
 type Scanner struct {
-	claude *claudeScanner
-	codex  *codexScanner
+	claude  *claudeScanner
+	codex   *codexScanner
+	copilot *copilotScanner
 }
 
 // New creates a new Scanner.
 func New() *Scanner {
 	home, _ := os.UserHomeDir()
 	return &Scanner{
-		claude: newClaudeScanner(home),
-		codex:  newCodexScanner(home),
+		claude:  newClaudeScanner(home),
+		codex:   newCodexScanner(home),
+		copilot: newCopilotScanner(home),
 	}
 }
 
@@ -55,6 +57,22 @@ func (s *Scanner) Scan(ctx context.Context) ([]model.SessionInfo, error) {
 		go func() {
 			defer wg.Done()
 			results, err := s.codex.scan(ctx)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				scanErr = err
+				return
+			}
+			sessions = append(sessions, results...)
+		}()
+	}
+
+	// Copilot CLI scanner.
+	if s.copilot != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results, err := s.copilot.scan(ctx)
 			mu.Lock()
 			defer mu.Unlock()
 			if err != nil {
