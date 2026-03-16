@@ -55,7 +55,7 @@ func (m *Monitor) Start(ctx context.Context) {
 	m.stop = make(chan struct{})
 	m.done = make(chan struct{})
 
-	m.poll(ctx)
+	m.seed(ctx)
 
 	go func() {
 		defer close(m.done)
@@ -89,6 +89,26 @@ func (m *Monitor) Scan(_ context.Context) ([]model.SessionInfo, error) {
 	result := make([]model.SessionInfo, len(m.sessions))
 	copy(result, m.sessions)
 	return result, nil
+}
+
+// seed performs a scan that populates the session cache and prev map
+// without sending any notifications. Used for the initial scan on startup.
+func (m *Monitor) seed(ctx context.Context) {
+	sessions, err := m.scanner.Scan(ctx)
+	if err != nil {
+		return
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	current := make(map[string]model.Status, len(sessions))
+	for _, s := range sessions {
+		current[s.ID] = s.Status
+	}
+
+	m.sessions = sessions
+	m.prev = current
 }
 
 func (m *Monitor) poll(ctx context.Context) {

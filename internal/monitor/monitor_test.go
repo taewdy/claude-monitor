@@ -261,6 +261,68 @@ func TestStartAndStop(t *testing.T) {
 	}
 }
 
+func TestStartInitialScanSuppressesNotifications(t *testing.T) {
+	sessions := []model.SessionInfo{
+		session("s1", model.StatusActive),
+		session("s2", model.StatusIdle),
+	}
+	var callCount atomic.Int32
+	sc := &mockScanner{
+		scanFunc: func() ([]model.SessionInfo, error) {
+			callCount.Add(1)
+			return sessions, nil
+		},
+	}
+	n := &mockNotifier{}
+	m := New(sc, n, time.Hour)
+
+	ctx := context.Background()
+	m.Start(ctx)
+
+	// Initial scan should have populated the cache without notifying.
+	if c := callCount.Load(); c != 1 {
+		t.Fatalf("expected 1 scan call after Start, got %d", c)
+	}
+	if changes := n.getChanges(); len(changes) != 0 {
+		t.Fatalf("expected 0 notifications after initial scan, got %d", len(changes))
+	}
+
+	// Cache should be populated so Scan() returns results immediately.
+	result, err := m.Scan(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(result) != 2 {
+		t.Fatalf("expected 2 cached sessions, got %d", len(result))
+	}
+
+	// A subsequent poll that changes status should notify.
+	sc.mu.Lock()
+	sc.scanFunc = func() ([]model.SessionInfo, error) {
+		callCount.Add(1)
+		return []model.SessionInfo{
+			session("s1", model.StatusIdle),
+			session("s2", model.StatusIdle),
+		}, nil
+	}
+	sc.mu.Unlock()
+
+	m.poll(ctx)
+
+	changes := n.getChanges()
+	if len(changes) != 1 {
+		t.Fatalf("expected 1 notification after status change, got %d", len(changes))
+	}
+	if changes[0].Session.ID != "s1" {
+		t.Errorf("expected notification for s1, got %q", changes[0].Session.ID)
+	}
+	if changes[0].OldStatus != model.StatusActive || changes[0].NewStatus != model.StatusIdle {
+		t.Errorf("unexpected status change: %q -> %q", changes[0].OldStatus, changes[0].NewStatus)
+	}
+
+	m.Stop()
+}
+
 func TestStartContextCancellation(t *testing.T) {
 	sc := &mockScanner{results: nil}
 	n := &mockNotifier{}
