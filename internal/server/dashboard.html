@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Claude Monitor</title>
+    <style>
+        :root {
+            --color-claude: #E87040;
+            --color-codex: #10A37F;
+            --color-copilot: #0078D4;
+            --status-active: #22c55e;
+            --status-idle: #eab308;
+            --status-waiting: #f59e0b;
+            --status-finished: #6b7280;
+            --bg-primary: #0f1117;
+            --bg-card: #1a1d27;
+            --bg-header: #151821;
+            --text-primary: #e4e4e7;
+            --text-secondary: #a1a1aa;
+            --border: #2a2d3a;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            min-height: 100vh;
+        }
+        header {
+            background: var(--bg-header);
+            border-bottom: 1px solid var(--border);
+            padding: 16px 24px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+        header h1 { font-size: 18px; font-weight: 600; }
+        .summary {
+            display: flex;
+            gap: 16px;
+            align-items: center;
+        }
+        .summary-item {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 13px;
+            color: var(--text-secondary);
+        }
+        .summary-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+        }
+        .summary-count {
+            font-weight: 700;
+            color: var(--text-primary);
+        }
+        .provider-groups {
+            padding: 24px;
+            display: flex;
+            flex-direction: column;
+            gap: 32px;
+        }
+        .provider-group h2 {
+            font-size: 14px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            margin-bottom: 12px;
+            padding-bottom: 8px;
+            border-bottom: 2px solid var(--border);
+        }
+        .cards {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+            gap: 12px;
+        }
+        .card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 16px;
+            border-left: 3px solid var(--border);
+        }
+        .card-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 10px;
+        }
+        .card-title {
+            font-size: 14px;
+            font-weight: 600;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            max-width: 200px;
+        }
+        .badge {
+            font-size: 11px;
+            font-weight: 600;
+            padding: 2px 8px;
+            border-radius: 10px;
+            text-transform: uppercase;
+            letter-spacing: 0.03em;
+        }
+        .badge-provider {
+            color: #fff;
+        }
+        .badge-status {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+        }
+        .status-dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            display: inline-block;
+        }
+        .status-active .status-dot {
+            background: var(--status-active);
+            animation: pulse 2s ease-in-out infinite;
+        }
+        .status-idle .status-dot { background: var(--status-idle); }
+        .status-waiting .status-dot { background: var(--status-waiting); }
+        .status-finished .status-dot { background: var(--status-finished); }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.4; }
+        }
+        .card-meta {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 6px 16px;
+            font-size: 12px;
+            color: var(--text-secondary);
+        }
+        .meta-item {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+        .meta-label { opacity: 0.7; }
+        .meta-value { color: var(--text-primary); }
+        .empty-state {
+            text-align: center;
+            padding: 60px 20px;
+            color: var(--text-secondary);
+            font-size: 14px;
+        }
+        .refresh-indicator {
+            font-size: 11px;
+            color: var(--text-secondary);
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>Claude Monitor</h1>
+        <div class="summary" id="summary"></div>
+        <span class="refresh-indicator" id="refresh-indicator"></span>
+    </header>
+    <div class="provider-groups" id="app"></div>
+
+    <script>
+    (function() {
+        const REFRESH_MS = 5000;
+        const PROVIDER_COLORS = { claude: '#E87040', codex: '#10A37F', copilot: '#0078D4' };
+        const PROVIDER_ORDER = ['claude', 'codex', 'copilot'];
+        const STATUS_COLORS = { active: '#22c55e', idle: '#eab308', waiting: '#f59e0b', finished: '#6b7280' };
+
+        function relativeTime(iso) {
+            const diff = Math.max(0, Math.floor((Date.now() - new Date(iso).getTime()) / 1000));
+            if (diff < 60) return diff + 's ago';
+            if (diff < 3600) return Math.floor(diff / 60) + 'm ago';
+            if (diff < 86400) return Math.floor(diff / 3600) + 'h ago';
+            return Math.floor(diff / 86400) + 'd ago';
+        }
+
+        function formatTokens(n) {
+            if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
+            if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
+            return String(n);
+        }
+
+        function renderCard(s) {
+            const color = PROVIDER_COLORS[s.provider] || '#888';
+            const statusColor = STATUS_COLORS[s.status] || '#6b7280';
+            const projectName = s.projectDir ? s.projectDir.split('/').filter(Boolean).pop() : '';
+
+            let metaRows = '';
+            metaRows += '<div class="meta-item"><span class="meta-label">Project:</span> <span class="meta-value">' + esc(projectName) + '</span></div>';
+            metaRows += '<div class="meta-item"><span class="meta-label">Last:</span> <span class="meta-value">' + relativeTime(s.lastActive) + '</span></div>';
+            if (s.gitBranch) {
+                metaRows += '<div class="meta-item"><span class="meta-label">Branch:</span> <span class="meta-value">' + esc(s.gitBranch) + '</span></div>';
+            }
+            metaRows += '<div class="meta-item"><span class="meta-label">Tokens:</span> <span class="meta-value">' + formatTokens(s.inputTokens) + ' in / ' + formatTokens(s.outputTokens) + ' out</span></div>';
+            metaRows += '<div class="meta-item"><span class="meta-label">Messages:</span> <span class="meta-value">' + s.messageCount + '</span></div>';
+            if (s.subagentCount) {
+                metaRows += '<div class="meta-item"><span class="meta-label">Subagents:</span> <span class="meta-value">' + s.subagentCount + '</span></div>';
+            }
+
+            return '<div class="card" style="border-left-color:' + color + '">'
+                + '<div class="card-header">'
+                +   '<span class="card-title">' + esc(s.title || s.id) + '</span>'
+                +   '<span class="badge badge-provider" style="background:' + color + '">' + esc(s.provider) + '</span>'
+                + '</div>'
+                + '<div style="margin-bottom:10px">'
+                +   '<span class="badge badge-status status-' + esc(s.status) + '" style="color:' + statusColor + ';background:' + statusColor + '1a;border:1px solid ' + statusColor + '33">'
+                +     '<span class="status-dot"></span>' + esc(s.status)
+                +   '</span>'
+                + '</div>'
+                + '<div class="card-meta">' + metaRows + '</div>'
+                + '</div>';
+        }
+
+        function esc(str) {
+            var d = document.createElement('div');
+            d.textContent = String(str);
+            return d.innerHTML;
+        }
+
+        function render(sessions) {
+            var app = document.getElementById('app');
+            var summary = document.getElementById('summary');
+
+            if (!sessions || sessions.length === 0) {
+                app.innerHTML = '<div class="empty-state">No active sessions detected.</div>';
+                summary.innerHTML = '';
+                return;
+            }
+
+            // Group by provider
+            var groups = {};
+            var counts = {};
+            PROVIDER_ORDER.forEach(function(p) { groups[p] = []; counts[p] = 0; });
+            sessions.forEach(function(s) {
+                var p = s.provider || 'unknown';
+                if (!groups[p]) { groups[p] = []; counts[p] = 0; }
+                groups[p].push(s);
+                counts[p]++;
+            });
+
+            // Summary
+            var summaryHtml = '';
+            PROVIDER_ORDER.forEach(function(p) {
+                if (counts[p] > 0) {
+                    summaryHtml += '<div class="summary-item">'
+                        + '<span class="summary-dot" style="background:' + PROVIDER_COLORS[p] + '"></span>'
+                        + '<span class="summary-count">' + counts[p] + '</span>'
+                        + esc(p)
+                        + '</div>';
+                }
+            });
+            summary.innerHTML = summaryHtml;
+
+            // Groups
+            var html = '';
+            PROVIDER_ORDER.forEach(function(p) {
+                if (groups[p].length === 0) return;
+                html += '<div class="provider-group">';
+                html += '<h2 style="border-bottom-color:' + PROVIDER_COLORS[p] + '">' + esc(p) + ' Sessions (' + groups[p].length + ')</h2>';
+                html += '<div class="cards">';
+                groups[p].forEach(function(s) { html += renderCard(s); });
+                html += '</div></div>';
+            });
+            app.innerHTML = html;
+        }
+
+        function refresh() {
+            fetch('/api/sessions')
+                .then(function(r) { return r.json(); })
+                .then(function(data) {
+                    render(data);
+                    document.getElementById('refresh-indicator').textContent = 'Updated ' + new Date().toLocaleTimeString();
+                })
+                .catch(function(err) {
+                    console.error('fetch error:', err);
+                });
+        }
+
+        refresh();
+        setInterval(refresh, REFRESH_MS);
+    })();
+    </script>
+</body>
+</html>

@@ -6,6 +6,7 @@ package server
 import (
 	"bytes"
 	"context"
+	_ "embed"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -13,6 +14,9 @@ import (
 
 	"github.com/universe/claude-monitor/internal/model"
 )
+
+//go:embed dashboard.html
+var dashboardHTML []byte
 
 // SessionScanner is the interface used by the server to retrieve sessions.
 type SessionScanner interface {
@@ -36,7 +40,10 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 }
 
 func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
-	w.WriteHeader(http.StatusOK)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if _, err := w.Write(dashboardHTML); err != nil {
+		log.Printf("failed to write dashboard: %v", err)
+	}
 }
 
 func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {

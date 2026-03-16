@@ -5,6 +5,8 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -34,12 +36,24 @@ func doRequest(t *testing.T, method, path string, mockSetup func(*mocks.MockSess
 }
 
 func TestNew(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	mockScanner := mocks.NewMockSessionScanner(ctrl)
+	tests := map[string]struct {
+		scanner SessionScanner
+	}{
+		"with_mock_scanner": {
+			scanner: mocks.NewMockSessionScanner(gomock.NewController(t)),
+		},
+		"with_nil_scanner": {
+			scanner: nil,
+		},
+	}
 
-	srv := New(mockScanner)
-	if srv == nil {
-		t.Fatal("New() returned nil")
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			srv := New(tt.scanner)
+			if srv == nil {
+				t.Fatal("New() returned nil")
+			}
+		})
 	}
 }
 
@@ -74,107 +88,241 @@ func TestServer_RegisterRoutes(t *testing.T) {
 	}
 }
 
+func TestServer_HandleDashboard(t *testing.T) {
+	rec := doRequest(t, http.MethodGet, "/", func(s *mocks.MockSessionScanner) {
+		s.EXPECT().Scan(gomock.Any()).Return(nil, nil).AnyTimes()
+	})
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("status code: got %d, want %d", rec.Code, http.StatusOK)
+	}
+	if got := rec.Header().Get("Content-Type"); got != "text/html; charset=utf-8" {
+		t.Errorf("Content-Type: got %q, want %q", got, "text/html; charset=utf-8")
+	}
+	if rec.Body.Len() == 0 {
+		t.Error("expected non-empty body")
+	}
+}
+
 func TestServer_HandleSessions(t *testing.T) {
 	now := time.Date(2025, 1, 15, 10, 30, 0, 0, time.UTC)
+	earlier := now.Add(-5 * time.Minute)
 
-	type fields struct {
-		mockOperations func(scanner *mocks.MockSessionScanner)
-	}
+	scanErr := errors.New("scanner failed")
 
 	type wants struct {
-		statusCode int
-		sessions   []model.SessionInfo
-		errBody    bool
+		statusCode  int
+		contentType string
+		sessions    []model.SessionInfo
+		errContains string
 	}
 
 	tests := map[string]struct {
-		fields fields
-		wants  wants
+		mockSetup func(scanner *mocks.MockSessionScanner)
+		wants     wants
 	}{
 		"returns_sessions_as_json": {
-			fields: fields{
-				mockOperations: func(scanner *mocks.MockSessionScanner) {
-					scanner.EXPECT().Scan(gomock.Any()).Return([]model.SessionInfo{
-						{
-							ID:           "s1",
-							Provider:     model.ProviderClaude,
-							Status:       model.StatusActive,
-							Title:        "test session",
-							ProjectDir:   "/proj",
-							StartedAt:    now,
-							LastActive:   now,
-							InputTokens:  100,
-							OutputTokens: 200,
-							MessageCount: 5,
-						},
-					}, nil)
-				},
+			mockSetup: func(scanner *mocks.MockSessionScanner) {
+				scanner.EXPECT().Scan(gomock.Any()).Return([]model.SessionInfo{
+					{
+						ID:            "s1",
+						Provider:      model.ProviderClaude,
+						Status:        model.StatusActive,
+						Title:         "test session",
+						ProjectDir:    "/proj",
+						StartedAt:     now,
+						LastActive:    now,
+						InputTokens:   100,
+						OutputTokens:  200,
+						MessageCount:  5,
+						SubagentCount: 2,
+					},
+				}, nil)
 			},
 			wants: wants{
-				statusCode: http.StatusOK,
+				statusCode:  http.StatusOK,
+				contentType: "application/json",
 				sessions: []model.SessionInfo{
 					{
-						ID:           "s1",
-						Provider:     model.ProviderClaude,
-						Status:       model.StatusActive,
-						Title:        "test session",
-						ProjectDir:   "/proj",
-						StartedAt:    now,
-						LastActive:   now,
-						InputTokens:  100,
-						OutputTokens: 200,
-						MessageCount: 5,
+						ID:            "s1",
+						Provider:      model.ProviderClaude,
+						Status:        model.StatusActive,
+						Title:         "test session",
+						ProjectDir:    "/proj",
+						StartedAt:     now,
+						LastActive:    now,
+						InputTokens:   100,
+						OutputTokens:  200,
+						MessageCount:  5,
+						SubagentCount: 2,
 					},
 				},
 			},
 		},
+		"multiple_sessions_multiple_providers": {
+			mockSetup: func(scanner *mocks.MockSessionScanner) {
+				scanner.EXPECT().Scan(gomock.Any()).Return([]model.SessionInfo{
+					{
+						ID:         "s1",
+						Provider:   model.ProviderClaude,
+						Status:     model.StatusActive,
+						Title:      "claude session",
+						ProjectDir: "/proj/a",
+						GitBranch:  "feat/auth",
+						StartedAt:  earlier,
+						LastActive: now,
+					},
+					{
+						ID:         "s2",
+						Provider:   model.ProviderCodex,
+						Status:     model.StatusIdle,
+						Title:      "codex session",
+						ProjectDir: "/proj/b",
+						StartedAt:  earlier,
+						LastActive: now,
+					},
+					{
+						ID:         "s3",
+						Provider:   model.ProviderCopilot,
+						Status:     model.StatusWaiting,
+						Title:      "copilot session",
+						ProjectDir: "/proj/c",
+						StartedAt:  earlier,
+						LastActive: now,
+					},
+				}, nil)
+			},
+			wants: wants{
+				statusCode:  http.StatusOK,
+				contentType: "application/json",
+				sessions: []model.SessionInfo{
+					{ID: "s1", Provider: model.ProviderClaude, Status: model.StatusActive, Title: "claude session", ProjectDir: "/proj/a", GitBranch: "feat/auth", StartedAt: earlier, LastActive: now},
+					{ID: "s2", Provider: model.ProviderCodex, Status: model.StatusIdle, Title: "codex session", ProjectDir: "/proj/b", StartedAt: earlier, LastActive: now},
+					{ID: "s3", Provider: model.ProviderCopilot, Status: model.StatusWaiting, Title: "copilot session", ProjectDir: "/proj/c", StartedAt: earlier, LastActive: now},
+				},
+			},
+		},
 		"returns_empty_array_when_no_sessions": {
-			fields: fields{
-				mockOperations: func(scanner *mocks.MockSessionScanner) {
-					scanner.EXPECT().Scan(gomock.Any()).Return([]model.SessionInfo{}, nil)
-				},
+			mockSetup: func(scanner *mocks.MockSessionScanner) {
+				scanner.EXPECT().Scan(gomock.Any()).Return([]model.SessionInfo{}, nil)
 			},
 			wants: wants{
-				statusCode: http.StatusOK,
-				sessions:   []model.SessionInfo{},
+				statusCode:  http.StatusOK,
+				contentType: "application/json",
+				sessions:    []model.SessionInfo{},
 			},
 		},
-		"returns_error_when_scan_fails": {
-			fields: fields{
-				mockOperations: func(scanner *mocks.MockSessionScanner) {
-					scanner.EXPECT().Scan(gomock.Any()).Return(nil, errors.New("scan failed"))
-				},
+		"nil_scan_result_returns_empty_array": {
+			mockSetup: func(scanner *mocks.MockSessionScanner) {
+				scanner.EXPECT().Scan(gomock.Any()).Return(nil, nil)
 			},
 			wants: wants{
-				statusCode: http.StatusInternalServerError,
-				errBody:    true,
+				statusCode:  http.StatusOK,
+				contentType: "application/json",
+				sessions:    []model.SessionInfo{},
 			},
 		},
-		"returns_nil_scan_result_as_empty": {
-			fields: fields{
-				mockOperations: func(scanner *mocks.MockSessionScanner) {
-					scanner.EXPECT().Scan(gomock.Any()).Return(nil, nil)
-				},
+		"scan_error_returns_500": {
+			mockSetup: func(scanner *mocks.MockSessionScanner) {
+				scanner.EXPECT().Scan(gomock.Any()).Return(nil, scanErr)
 			},
 			wants: wants{
-				statusCode: http.StatusOK,
+				statusCode:  http.StatusInternalServerError,
+				errContains: "scan error",
+			},
+		},
+		"session_with_all_fields_populated": {
+			mockSetup: func(scanner *mocks.MockSessionScanner) {
+				scanner.EXPECT().Scan(gomock.Any()).Return([]model.SessionInfo{
+					{
+						ID:            "full-session",
+						Provider:      model.ProviderClaude,
+						Status:        model.StatusActive,
+						Title:         "full test",
+						ProjectDir:    "/home/user/project",
+						GitBranch:     "main",
+						StartedAt:     earlier,
+						LastActive:    now,
+						InputTokens:   15000,
+						OutputTokens:  32000,
+						MessageCount:  42,
+						SubagentCount: 3,
+						PID:           9876,
+					},
+				}, nil)
+			},
+			wants: wants{
+				statusCode:  http.StatusOK,
+				contentType: "application/json",
+				sessions: []model.SessionInfo{
+					{
+						ID:            "full-session",
+						Provider:      model.ProviderClaude,
+						Status:        model.StatusActive,
+						Title:         "full test",
+						ProjectDir:    "/home/user/project",
+						GitBranch:     "main",
+						StartedAt:     earlier,
+						LastActive:    now,
+						InputTokens:   15000,
+						OutputTokens:  32000,
+						MessageCount:  42,
+						SubagentCount: 3,
+						PID:           9876,
+					},
+				},
+			},
+		},
+		"session_with_finished_status": {
+			mockSetup: func(scanner *mocks.MockSessionScanner) {
+				scanner.EXPECT().Scan(gomock.Any()).Return([]model.SessionInfo{
+					{
+						ID:         "done-1",
+						Provider:   model.ProviderCodex,
+						Status:     model.StatusFinished,
+						Title:      "completed task",
+						ProjectDir: "/tmp",
+						StartedAt:  earlier,
+						LastActive: now,
+					},
+				}, nil)
+			},
+			wants: wants{
+				statusCode:  http.StatusOK,
+				contentType: "application/json",
+				sessions: []model.SessionInfo{
+					{
+						ID:         "done-1",
+						Provider:   model.ProviderCodex,
+						Status:     model.StatusFinished,
+						Title:      "completed task",
+						ProjectDir: "/tmp",
+						StartedAt:  earlier,
+						LastActive: now,
+					},
+				},
 			},
 		},
 	}
 
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			rec := doRequest(t, http.MethodGet, "/api/sessions", tt.fields.mockOperations)
+			rec := doRequest(t, http.MethodGet, "/api/sessions", tt.mockSetup)
 
 			if rec.Code != tt.wants.statusCode {
 				t.Errorf("status code: got %d, want %d", rec.Code, tt.wants.statusCode)
 			}
 
-			if tt.wants.errBody {
-				if rec.Body.Len() == 0 {
-					t.Error("expected error body, got empty response")
+			if tt.wants.errContains != "" {
+				body := rec.Body.String()
+				if !strings.Contains(body, tt.wants.errContains) {
+					t.Errorf("expected body to contain %q, got %q", tt.wants.errContains, body)
 				}
 				return
+			}
+
+			if got := rec.Header().Get("Content-Type"); got != tt.wants.contentType {
+				t.Errorf("Content-Type: got %q, want %q", got, tt.wants.contentType)
 			}
 
 			if tt.wants.sessions != nil {
@@ -183,33 +331,79 @@ func TestServer_HandleSessions(t *testing.T) {
 					t.Fatalf("failed to decode response: %v", err)
 				}
 
-				if len(got) != len(tt.wants.sessions) {
-					t.Errorf("session count: got %d, want %d", len(got), len(tt.wants.sessions))
-					return
-				}
-
-				for i, want := range tt.wants.sessions {
-					if got[i].ID != want.ID {
-						t.Errorf("session[%d].ID: got %q, want %q", i, got[i].ID, want.ID)
-					}
-					if got[i].Provider != want.Provider {
-						t.Errorf("session[%d].Provider: got %q, want %q", i, got[i].Provider, want.Provider)
-					}
-					if got[i].Status != want.Status {
-						t.Errorf("session[%d].Status: got %q, want %q", i, got[i].Status, want.Status)
-					}
+				if !reflect.DeepEqual(got, tt.wants.sessions) {
+					t.Errorf("sessions mismatch:\ngot:  %+v\nwant: %+v", got, tt.wants.sessions)
 				}
 			}
 		})
 	}
 }
 
-func TestServer_HandleDashboard(t *testing.T) {
-	rec := doRequest(t, http.MethodGet, "/", func(s *mocks.MockSessionScanner) {
-		s.EXPECT().Scan(gomock.Any()).Return(nil, nil).AnyTimes()
+func TestServer_HandleSessions_ResponseFormat(t *testing.T) {
+	now := time.Date(2025, 6, 15, 10, 0, 0, 0, time.UTC)
+
+	rec := doRequest(t, http.MethodGet, "/api/sessions", func(s *mocks.MockSessionScanner) {
+		s.EXPECT().Scan(gomock.Any()).Return([]model.SessionInfo{
+			{
+				ID:            "sess-1",
+				Provider:      model.ProviderClaude,
+				Status:        model.StatusActive,
+				Title:         "test session",
+				ProjectDir:    "/proj",
+				GitBranch:     "main",
+				StartedAt:     now,
+				LastActive:    now,
+				InputTokens:   500,
+				OutputTokens:  1000,
+				MessageCount:  3,
+				SubagentCount: 1,
+				PID:           1234,
+			},
+		}, nil)
 	})
 
 	if rec.Code != http.StatusOK {
-		t.Errorf("status code: got %d, want %d", rec.Code, http.StatusOK)
+		t.Fatalf("status code: got %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	// Verify the JSON contains expected camelCase field names.
+	var raw []map[string]json.RawMessage
+	if err := json.NewDecoder(rec.Body).Decode(&raw); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if len(raw) != 1 {
+		t.Fatalf("expected 1 session, got %d", len(raw))
+	}
+
+	expectedKeys := []string{
+		"id", "provider", "status", "title", "projectDir",
+		"gitBranch", "startedAt", "lastActive",
+		"inputTokens", "outputTokens", "messageCount",
+		"subagentCount", "pid",
+	}
+
+	for _, key := range expectedKeys {
+		t.Run("json_field_"+key, func(t *testing.T) {
+			if _, ok := raw[0][key]; !ok {
+				t.Errorf("expected JSON key %q not found in response", key)
+			}
+		})
+	}
+}
+
+func TestServer_HandleSessions_EmptyArrayNotNull(t *testing.T) {
+	// When scanner returns nil, the JSON response should be [] not null.
+	rec := doRequest(t, http.MethodGet, "/api/sessions", func(s *mocks.MockSessionScanner) {
+		s.EXPECT().Scan(gomock.Any()).Return(nil, nil)
+	})
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status code: got %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	body := strings.TrimSpace(rec.Body.String())
+	if body != "[]" {
+		t.Errorf("expected empty JSON array '[]', got %q", body)
 	}
 }
