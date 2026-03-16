@@ -182,20 +182,25 @@ func readTailLines(r io.Reader, n int) []string {
 
 // determineStatus applies the status rules:
 //   - PID dead → finished
+//   - PID alive + recent activity (lastActive within 60s) → active
+//   - PID alive + no messages yet (lastActive is zero) → active
 //   - PID alive + last msg is assistant role → waiting
-//   - PID alive + last msg < 60s → active
-//   - PID alive + last msg > 60s → idle
+//   - default → idle
 func (c *claudeScanner) determineStatus(pid int, lastActive time.Time, lastRole string) model.Status {
 	if !isProcessAlive(pid) {
 		return model.StatusFinished
 	}
 
-	if lastRole == "assistant" {
-		return model.StatusWaiting
-	}
-
 	if !lastActive.IsZero() && time.Since(lastActive) < 60*time.Second {
 		return model.StatusActive
+	}
+
+	if lastActive.IsZero() {
+		return model.StatusActive
+	}
+
+	if lastRole == "assistant" {
+		return model.StatusWaiting
 	}
 
 	return model.StatusIdle

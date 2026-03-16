@@ -605,11 +605,26 @@ func TestClaudeScanner_StatusDetermination(t *testing.T) {
 		"alive_pid_last_msg_assistant_is_waiting": {
 			buildFS: func(t *testing.T, homeDir string) {
 				makeSession(t, homeDir, "waiting", alivePID, []jsonlMessage{
-					mkMsg("user", now.Add(-30*time.Second), nil),
-					mkMsg("assistant", now.Add(-10*time.Second), nil),
+					mkMsg("user", now.Add(-5*time.Minute), nil),
+					mkMsg("assistant", now.Add(-2*time.Minute), nil),
 				})
 			},
 			status: model.StatusWaiting,
+		},
+		"alive_pid_no_messages_is_active": {
+			buildFS: func(t *testing.T, homeDir string) {
+				makeSession(t, homeDir, "no-msgs", alivePID, nil)
+			},
+			status: model.StatusActive,
+		},
+		"alive_pid_recent_assistant_msg_is_active": {
+			buildFS: func(t *testing.T, homeDir string) {
+				makeSession(t, homeDir, "recent-asst", alivePID, []jsonlMessage{
+					mkMsg("user", now.Add(-10*time.Second), nil),
+					mkMsg("assistant", now.Add(-5*time.Second), nil),
+				})
+			},
+			status: model.StatusActive,
 		},
 	}
 
