@@ -155,6 +155,70 @@
             font-size: 11px;
             color: var(--text-secondary);
         }
+        .filter-bar {
+            background: var(--bg-header);
+            border-bottom: 1px solid var(--border);
+            padding: 12px 24px;
+            display: flex;
+            align-items: center;
+            gap: 24px;
+            flex-wrap: wrap;
+        }
+        .filter-group {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .filter-label {
+            font-size: 11px;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            margin-right: 2px;
+        }
+        .filter-pill {
+            font-size: 11px;
+            font-weight: 600;
+            padding: 3px 10px;
+            border-radius: 12px;
+            border: 1px solid var(--border);
+            background: transparent;
+            color: var(--text-secondary);
+            cursor: pointer;
+            transition: all 0.15s ease;
+        }
+        .filter-pill:hover {
+            border-color: var(--text-secondary);
+        }
+        .filter-pill.selected {
+            background: var(--text-primary);
+            color: var(--bg-primary);
+            border-color: var(--text-primary);
+        }
+        .filter-pill.status-active.selected { background: var(--status-active); border-color: var(--status-active); color: #fff; }
+        .filter-pill.status-idle.selected { background: var(--status-idle); border-color: var(--status-idle); color: #000; }
+        .filter-pill.status-waiting.selected { background: var(--status-waiting); border-color: var(--status-waiting); color: #000; }
+        .filter-pill.status-finished.selected { background: var(--status-finished); border-color: var(--status-finished); color: #fff; }
+        .filter-pill.provider-claude.selected { background: var(--color-claude); border-color: var(--color-claude); color: #fff; }
+        .filter-pill.provider-codex.selected { background: var(--color-codex); border-color: var(--color-codex); color: #fff; }
+        .filter-pill.provider-copilot.selected { background: var(--color-copilot); border-color: var(--color-copilot); color: #fff; }
+        .days-select {
+            font-size: 11px;
+            font-weight: 600;
+            padding: 3px 8px;
+            border-radius: 12px;
+            border: 1px solid var(--border);
+            background: var(--bg-card);
+            color: var(--text-primary);
+            cursor: pointer;
+            appearance: none;
+            -webkit-appearance: none;
+            padding-right: 20px;
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%23a1a1aa'/%3E%3C/svg%3E");
+            background-repeat: no-repeat;
+            background-position: right 6px center;
+        }
+        .days-select:focus { outline: none; border-color: var(--text-secondary); }
     </style>
 </head>
 <body>
@@ -163,6 +227,30 @@
         <div class="summary" id="summary"></div>
         <span class="refresh-indicator" id="refresh-indicator"></span>
     </header>
+    <div class="filter-bar" id="filter-bar">
+        <div class="filter-group">
+            <span class="filter-label">Status</span>
+            <button class="filter-pill status-active selected" data-filter="status" data-value="active">Active</button>
+            <button class="filter-pill status-idle" data-filter="status" data-value="idle">Idle</button>
+            <button class="filter-pill status-waiting" data-filter="status" data-value="waiting">Waiting</button>
+            <button class="filter-pill status-finished" data-filter="status" data-value="finished">Finished</button>
+        </div>
+        <div class="filter-group">
+            <span class="filter-label">Provider</span>
+            <button class="filter-pill provider-claude selected" data-filter="provider" data-value="claude">Claude</button>
+            <button class="filter-pill provider-codex selected" data-filter="provider" data-value="codex">Codex</button>
+            <button class="filter-pill provider-copilot selected" data-filter="provider" data-value="copilot">Copilot</button>
+        </div>
+        <div class="filter-group">
+            <span class="filter-label">Period</span>
+            <select class="days-select" id="days-select">
+                <option value="0">Today</option>
+                <option value="7">Last 7 days</option>
+                <option value="30">Last 30 days</option>
+                <option value="-1">All time</option>
+            </select>
+        </div>
+    </div>
     <div class="provider-groups" id="app"></div>
 
     <script>
@@ -171,6 +259,86 @@
         const PROVIDER_COLORS = { claude: '#E87040', codex: '#10A37F', copilot: '#0078D4' };
         const PROVIDER_ORDER = ['claude', 'codex', 'copilot'];
         const STATUS_COLORS = { active: '#22c55e', idle: '#eab308', waiting: '#f59e0b', finished: '#6b7280' };
+        const STORAGE_KEY = 'claude-monitor-filters';
+
+        var filterState = loadFilterState();
+        var lastFetchedData = null;
+
+        function defaultFilterState() {
+            return {
+                statuses: ['active'],
+                providers: ['claude', 'codex', 'copilot'],
+                days: '0'
+            };
+        }
+
+        function loadFilterState() {
+            try {
+                var raw = localStorage.getItem(STORAGE_KEY);
+                if (raw) {
+                    var parsed = JSON.parse(raw);
+                    if (parsed && Array.isArray(parsed.statuses) && Array.isArray(parsed.providers) && parsed.days !== undefined) {
+                        return parsed;
+                    }
+                }
+            } catch (e) {}
+            return defaultFilterState();
+        }
+
+        function saveFilterState() {
+            try {
+                localStorage.setItem(STORAGE_KEY, JSON.stringify(filterState));
+            } catch (e) {}
+        }
+
+        function applyFilterUI() {
+            document.querySelectorAll('.filter-pill[data-filter="status"]').forEach(function(btn) {
+                btn.classList.toggle('selected', filterState.statuses.indexOf(btn.getAttribute('data-value')) !== -1);
+            });
+            document.querySelectorAll('.filter-pill[data-filter="provider"]').forEach(function(btn) {
+                btn.classList.toggle('selected', filterState.providers.indexOf(btn.getAttribute('data-value')) !== -1);
+            });
+            document.getElementById('days-select').value = filterState.days;
+        }
+
+        function initFilterListeners() {
+            document.querySelectorAll('.filter-pill').forEach(function(btn) {
+                btn.addEventListener('click', function() {
+                    var filterType = btn.getAttribute('data-filter');
+                    var value = btn.getAttribute('data-value');
+                    var arr = filterType === 'status' ? filterState.statuses : filterState.providers;
+                    var idx = arr.indexOf(value);
+                    if (idx === -1) {
+                        arr.push(value);
+                    } else {
+                        arr.splice(idx, 1);
+                    }
+                    saveFilterState();
+                    applyFilterUI();
+                    if (lastFetchedData) {
+                        render(applyFilters(lastFetchedData));
+                    }
+                });
+            });
+
+            document.getElementById('days-select').addEventListener('change', function() {
+                var newDays = this.value;
+                if (newDays !== filterState.days) {
+                    filterState.days = newDays;
+                    saveFilterState();
+                    refresh();
+                }
+            });
+        }
+
+        function applyFilters(sessions) {
+            if (!sessions) return [];
+            return sessions.filter(function(s) {
+                if (filterState.statuses.length > 0 && filterState.statuses.indexOf(s.status) === -1) return false;
+                if (filterState.providers.length > 0 && filterState.providers.indexOf(s.provider) === -1) return false;
+                return true;
+            });
+        }
 
         function relativeTime(iso) {
             const diff = Math.max(0, Math.floor((Date.now() - new Date(iso).getTime()) / 1000));
@@ -228,7 +396,7 @@
             var summary = document.getElementById('summary');
 
             if (!sessions || sessions.length === 0) {
-                app.innerHTML = '<div class="empty-state">No active sessions detected.</div>';
+                app.innerHTML = '<div class="empty-state">No sessions match current filters.</div>';
                 summary.innerHTML = '';
                 return;
             }
@@ -271,10 +439,13 @@
         }
 
         function refresh() {
-            fetch('/api/sessions')
+            var days = filterState.days;
+            var url = '/api/sessions?days=' + encodeURIComponent(days);
+            fetch(url)
                 .then(function(r) { return r.json(); })
                 .then(function(data) {
-                    render(data);
+                    lastFetchedData = data;
+                    render(applyFilters(data));
                     document.getElementById('refresh-indicator').textContent = 'Updated ' + new Date().toLocaleTimeString();
                 })
                 .catch(function(err) {
@@ -282,6 +453,8 @@
                 });
         }
 
+        applyFilterUI();
+        initFilterListeners();
         refresh();
         setInterval(refresh, REFRESH_MS);
     })();
