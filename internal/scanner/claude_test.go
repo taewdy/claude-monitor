@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -564,34 +563,19 @@ func TestClaudeScanner_Scan(t *testing.T) {
 // TestClaudeScanner_StatusDetermination tests the status priority rules:
 //  1. PID dead → finished
 //  2. PID alive + JSONL file modified within 2 min → active
-//  3. PID alive + CPU > 2% → active (catches long tool runs)
-//  4. PID alive + mtime is zero (no JSONL file) → active (brand new session)
-//  5. PID alive + last role "assistant" → waiting
-//  6. default → idle
+//  3. PID alive + mtime is zero (no JSONL file) → active (brand new session)
+//  4. PID alive + last role "assistant" → waiting
+//  5. default → idle
 //
-// Tests that need to exercise non-mtime fallback logic (idle, waiting, CPU)
-// set the JSONL mtime to 10 min ago via Chtimes so mtime doesn't short-circuit.
+// Tests that need to exercise non-mtime logic (idle, waiting) set the JSONL
+// mtime to 10 min ago via Chtimes so mtime doesn't short-circuit.
 // Tests for mtime-based detection leave the file as-is (just written, fresh mtime).
 func TestClaudeScanner_StatusDetermination(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	startedAt := now.Add(-1 * time.Hour)
 
-	// Track which PIDs the test considers "CPU active" so we can override
-	// isProcessActive deterministically without relying on real CPU sampling.
-	cpuActivePIDs := map[int]bool{}
-	origIsProcessActive := isProcessActive
-	isProcessActive = func(pid int) bool { return cpuActivePIDs[pid] }
-	t.Cleanup(func() { isProcessActive = origIsProcessActive })
-
-	// Use the current PID as a sentinel that we'll mark as CPU-active.
-	cpuActivePID := os.Getpid()
-	cpuActivePIDs[cpuActivePID] = true
-
-	// For low-CPU tests we need a separate alive PID not marked as CPU-active.
-	// os.Getppid() is alive and passes isProcessAlive (syscall.Kill(pid, 0)).
-	// This assumption holds on macOS; in containerized CI the parent is
-	// typically the test harness which is also signal-reachable.
-	lowCPUPID := os.Getppid()
+	// Use a known-alive PID for tests that need an alive process.
+	alivePID := os.Getpid()
 
 	// makeSession is a helper that writes session + optional JSONL for a given
 	// pid and message list, reducing boilerplate across status test cases.
@@ -617,22 +601,10 @@ func TestClaudeScanner_StatusDetermination(t *testing.T) {
 			},
 			status: model.StatusFinished,
 		},
-		"alive_pid_high_cpu_is_active": {
-			buildFS: func(t *testing.T, homeDir string) {
-				sid := "cpu-active"
-				cwd := "/tmp/" + sid
-				makeSession(t, homeDir, sid, cpuActivePID, []jsonlMessage{
-					mkMsg("user", now.Add(-10*time.Minute), nil),
-				})
-				// Set mtime to 10 min ago so mtime doesn't short-circuit before CPU check.
-				setFileMtime(t, homeDir, sid, cwd, now.Add(-10*time.Minute))
-			},
-			status: model.StatusActive,
-		},
 		"alive_pid_recent_file_mtime_is_active": {
 			buildFS: func(t *testing.T, homeDir string) {
 				// File just written, mtime is fresh — no Chtimes needed.
-				makeSession(t, homeDir, "recent", lowCPUPID, []jsonlMessage{
+				makeSession(t, homeDir, "recent", alivePID, []jsonlMessage{
 					mkMsg("user", now.Add(-3*time.Minute), nil),
 				})
 			},
@@ -642,7 +614,7 @@ func TestClaudeScanner_StatusDetermination(t *testing.T) {
 			buildFS: func(t *testing.T, homeDir string) {
 				sid := "idle"
 				cwd := "/tmp/" + sid
-				makeSession(t, homeDir, sid, lowCPUPID, []jsonlMessage{
+				makeSession(t, homeDir, sid, alivePID, []jsonlMessage{
 					mkMsg("user", now.Add(-10*time.Minute), nil),
 				})
 				// Set mtime to 10 min ago via Chtimes.
@@ -654,7 +626,7 @@ func TestClaudeScanner_StatusDetermination(t *testing.T) {
 			buildFS: func(t *testing.T, homeDir string) {
 				sid := "waiting"
 				cwd := "/tmp/" + sid
-				makeSession(t, homeDir, sid, lowCPUPID, []jsonlMessage{
+				makeSession(t, homeDir, sid, alivePID, []jsonlMessage{
 					mkMsg("user", now.Add(-10*time.Minute), nil),
 					mkMsg("assistant", now.Add(-6*time.Minute), nil),
 				})
@@ -665,14 +637,14 @@ func TestClaudeScanner_StatusDetermination(t *testing.T) {
 		},
 		"alive_pid_no_messages_is_active": {
 			buildFS: func(t *testing.T, homeDir string) {
-				makeSession(t, homeDir, "no-msgs", lowCPUPID, nil)
+				makeSession(t, homeDir, "no-msgs", alivePID, nil)
 			},
 			status: model.StatusActive,
 		},
 		"alive_pid_recent_assistant_msg_within_2min_is_active": {
 			buildFS: func(t *testing.T, homeDir string) {
 				// File just written, mtime is fresh — still active despite assistant last role.
-				makeSession(t, homeDir, "recent-asst", lowCPUPID, []jsonlMessage{
+				makeSession(t, homeDir, "recent-asst", alivePID, []jsonlMessage{
 					mkMsg("user", now.Add(-4*time.Minute), nil),
 					mkMsg("assistant", now.Add(-2*time.Minute), nil),
 				})
@@ -698,34 +670,6 @@ func TestClaudeScanner_StatusDetermination(t *testing.T) {
 				t.Errorf("status = %q, want %q", got[0].Status, tt.status)
 			}
 		})
-	}
-}
-
-// TestDefaultIsProcessActive tests the real ps-based implementation directly
-// (not the overridable var) to verify it correctly parses CPU output.
-// The busy-loop process pegs 100% CPU so it still exceeds the 2% threshold.
-func TestDefaultIsProcessActive(t *testing.T) {
-	// Spawn a CPU-busy process so we have a reliable high-CPU PID to test.
-	busyCmd := exec.Command("bash", "-c", "while true; do :; done")
-	if err := busyCmd.Start(); err != nil {
-		t.Fatalf("failed to start busy process: %v", err)
-	}
-	t.Cleanup(func() { busyCmd.Process.Kill(); busyCmd.Wait() })
-
-	// Poll until ps reports >0.1% CPU. The kernel's CPU accounting needs time
-	// to accumulate; 100ms is often not enough, so we retry up to 2s.
-	pid := busyCmd.Process.Pid
-	deadline := time.Now().Add(2 * time.Second)
-	for !defaultIsProcessActive(pid) {
-		if time.Now().After(deadline) {
-			t.Fatal("defaultIsProcessActive(busy process) never returned true within 2s")
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
-
-	// A non-existent PID should return false.
-	if defaultIsProcessActive(999999999) {
-		t.Error("defaultIsProcessActive(999999999) = true, want false")
 	}
 }
 

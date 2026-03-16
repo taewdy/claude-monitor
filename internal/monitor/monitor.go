@@ -29,6 +29,7 @@ type Monitor struct {
 	mu       sync.RWMutex
 	sessions []model.SessionInfo
 	prev     map[string]model.Status
+	pending  map[string]model.Status // pending status awaiting confirmation
 
 	started bool
 	stop    chan struct{}
@@ -42,6 +43,7 @@ func New(scanner SessionScanner, notifier notify.Notifier, interval time.Duratio
 		notifier: notifier,
 		interval: interval,
 		prev:     make(map[string]model.Status),
+		pending:  make(map[string]model.Status),
 	}
 }
 
@@ -126,40 +128,68 @@ func (m *Monitor) poll(ctx context.Context) {
 		current[s.ID] = s.Status
 	}
 
-	// Detect new and changed sessions.
+	// Detect new and changed sessions with debouncing.
+	// A status change must be seen on 2 consecutive polls before notifying.
+	// This prevents spurious notifications from CPU fluctuations.
 	for _, s := range sessions {
 		old, existed := m.prev[s.ID]
 		if !existed {
-			m.notify(ctx, notify.StatusChange{
+			// New sessions notify immediately (no debounce).
+			m.sendNotify(ctx, notify.StatusChange{
 				Session:   s,
 				OldStatus: "",
 				NewStatus: s.Status,
 			})
 		} else if old != s.Status {
-			m.notify(ctx, notify.StatusChange{
-				Session:   s,
-				OldStatus: old,
-				NewStatus: s.Status,
-			})
+			// Status changed — check if this matches a pending change.
+			if pend, ok := m.pending[s.ID]; ok && pend == s.Status {
+				// Confirmed: same new status seen twice in a row.
+				m.sendNotify(ctx, notify.StatusChange{
+					Session:   s,
+					OldStatus: old,
+					NewStatus: s.Status,
+				})
+				delete(m.pending, s.ID)
+			} else {
+				// First time seeing this new status — record as pending.
+				m.pending[s.ID] = s.Status
+			}
+		} else {
+			// Status unchanged — clear any pending transition.
+			delete(m.pending, s.ID)
 		}
 	}
 
-	// Detect disappeared sessions.
+	// Detect disappeared sessions (notify immediately).
 	for id, oldStatus := range m.prev {
 		if _, exists := current[id]; !exists {
-			m.notify(ctx, notify.StatusChange{
+			m.sendNotify(ctx, notify.StatusChange{
 				Session:   model.SessionInfo{ID: id},
 				OldStatus: oldStatus,
 				NewStatus: model.StatusFinished,
 			})
+			delete(m.pending, id)
 		}
 	}
 
 	m.sessions = sessions
-	m.prev = current
+	// Only update prev for confirmed transitions and unchanged statuses.
+	// Keep prev[id] at the old value while a change is still pending,
+	// so the next poll can confirm against the same baseline.
+	for id, status := range current {
+		if _, isPending := m.pending[id]; !isPending {
+			m.prev[id] = status
+		}
+	}
+	// Remove prev entries for disappeared sessions.
+	for id := range m.prev {
+		if _, exists := current[id]; !exists {
+			delete(m.prev, id)
+		}
+	}
 }
 
-func (m *Monitor) notify(ctx context.Context, change notify.StatusChange) {
+func (m *Monitor) sendNotify(ctx context.Context, change notify.StatusChange) {
 	if err := m.notifier.Notify(ctx, change); err != nil {
 		log.Printf("monitor: notification error: %v", err)
 	}

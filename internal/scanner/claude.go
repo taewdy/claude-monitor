@@ -7,9 +7,7 @@ import (
 	"encoding/json"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -189,23 +187,18 @@ func readTailLines(r io.Reader, n int) []string {
 }
 
 // determineStatus applies the status rules using JSONL file mtime as the
-// primary freshness signal (cheap os.Stat before expensive ps shell-out):
+// sole activity signal:
 //  1. PID dead → finished
 //  2. PID alive + JSONL file modified within 2 min → active
-//  3. PID alive + CPU > 2% → active (catches long tool runs)
-//  4. PID alive + mtime is zero (no JSONL file) → active (brand new session)
-//  5. PID alive + last role "assistant" → waiting
-//  6. default → idle
+//  3. PID alive + mtime is zero (no JSONL file) → active (brand new session)
+//  4. PID alive + last role "assistant" → waiting
+//  5. default → idle
 func (c *claudeScanner) determineStatus(pid int, jsonlMtime time.Time, lastRole string) model.Status {
 	if !isProcessAlive(pid) {
 		return model.StatusFinished
 	}
 
 	if !jsonlMtime.IsZero() && time.Since(jsonlMtime) < 2*time.Minute {
-		return model.StatusActive
-	}
-
-	if isProcessActive(pid) {
 		return model.StatusActive
 	}
 
@@ -218,23 +211,6 @@ func (c *claudeScanner) determineStatus(pid int, jsonlMtime time.Time, lastRole 
 	}
 
 	return model.StatusIdle
-}
-
-// isProcessActive checks if a process is actively using CPU by shelling out to
-// ps and checking if CPU usage exceeds 2.0%. Returns false on any error.
-// Declared as a variable so tests can override it.
-var isProcessActive = defaultIsProcessActive
-
-func defaultIsProcessActive(pid int) bool {
-	out, err := exec.Command("ps", "-o", "pcpu=", "-p", strconv.Itoa(pid)).Output()
-	if err != nil {
-		return false
-	}
-	cpu, err := strconv.ParseFloat(strings.TrimSpace(string(out)), 64)
-	if err != nil {
-		return false
-	}
-	return cpu > 2.0
 }
 
 // isProcessAlive checks if a process with the given PID exists.

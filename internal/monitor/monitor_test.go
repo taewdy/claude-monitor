@@ -97,13 +97,21 @@ func TestStatusChangeNotifies(t *testing.T) {
 	// Initial poll — new session.
 	m.poll(context.Background())
 
-	// Change status.
+	// First poll with new status — pending, no notification yet.
 	sc.set([]model.SessionInfo{session("s1", model.StatusIdle)}, nil)
 	m.poll(context.Background())
 
 	changes := n.getChanges()
+	if len(changes) != 1 {
+		t.Fatalf("expected 1 notification (initial only, change pending), got %d", len(changes))
+	}
+
+	// Second poll with same new status — confirmed, should notify.
+	m.poll(context.Background())
+
+	changes = n.getChanges()
 	if len(changes) != 2 {
-		t.Fatalf("expected 2 notifications, got %d", len(changes))
+		t.Fatalf("expected 2 notifications (initial + confirmed change), got %d", len(changes))
 	}
 	c := changes[1]
 	if c.OldStatus != model.StatusActive {
@@ -296,7 +304,7 @@ func TestStartInitialScanSuppressesNotifications(t *testing.T) {
 		t.Fatalf("expected 2 cached sessions, got %d", len(result))
 	}
 
-	// A subsequent poll that changes status should notify.
+	// A subsequent poll that changes status should pend (debounce).
 	sc.mu.Lock()
 	sc.scanFunc = func() ([]model.SessionInfo, error) {
 		callCount.Add(1)
@@ -307,11 +315,15 @@ func TestStartInitialScanSuppressesNotifications(t *testing.T) {
 	}
 	sc.mu.Unlock()
 
-	m.poll(ctx)
+	m.poll(ctx) // first poll with new status — pending
+	if changes := n.getChanges(); len(changes) != 0 {
+		t.Fatalf("expected 0 notifications after first changed poll, got %d", len(changes))
+	}
 
+	m.poll(ctx) // second poll confirms — should notify
 	changes := n.getChanges()
 	if len(changes) != 1 {
-		t.Fatalf("expected 1 notification after status change, got %d", len(changes))
+		t.Fatalf("expected 1 notification after confirmed status change, got %d", len(changes))
 	}
 	if changes[0].Session.ID != "s1" {
 		t.Errorf("expected notification for s1, got %q", changes[0].Session.ID)
@@ -321,6 +333,31 @@ func TestStartInitialScanSuppressesNotifications(t *testing.T) {
 	}
 
 	m.Stop()
+}
+
+func TestDebounceCancelledWhenStatusReverts(t *testing.T) {
+	sc := &mockScanner{results: []model.SessionInfo{
+		session("s1", model.StatusActive),
+	}}
+	n := &mockNotifier{}
+	m := New(sc, n, time.Hour)
+
+	// Initial poll.
+	m.poll(context.Background())
+
+	// Status flips to idle — pending.
+	sc.set([]model.SessionInfo{session("s1", model.StatusIdle)}, nil)
+	m.poll(context.Background())
+
+	// Status flips back to active before confirmation — pending cancelled.
+	sc.set([]model.SessionInfo{session("s1", model.StatusActive)}, nil)
+	m.poll(context.Background())
+
+	// No status change notification should have fired (only the initial new session).
+	changes := n.getChanges()
+	if len(changes) != 1 {
+		t.Fatalf("expected 1 notification (initial only), got %d", len(changes))
+	}
 }
 
 func TestStartContextCancellation(t *testing.T) {
