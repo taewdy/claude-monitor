@@ -83,13 +83,16 @@ func (c *codexScanner) scan(ctx context.Context) ([]model.SessionInfo, error) {
 		}
 
 		sessions = append(sessions, model.SessionInfo{
-			ID:         r.ID,
-			Provider:   model.ProviderCodex,
-			Status:     status,
-			Title:      r.Title,
-			ProjectDir: r.Cwd,
-			GitBranch:  r.GitBranch,
-			LastActive: time.Unix(updatedAt, 0),
+			ID:       r.ID,
+			Provider: model.ProviderCodex,
+			Status:   status,
+			Title:    r.Title,
+			// InputTokens holds the combined total (input+output) since the
+			// Codex DB stores a single tokens_used value without splitting.
+			InputTokens: r.TokensUsed,
+			ProjectDir:  r.Cwd,
+			GitBranch:   r.GitBranch,
+			LastActive:  time.Unix(updatedAt, 0),
 		})
 	}
 

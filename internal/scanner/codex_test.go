@@ -91,6 +91,9 @@ func assertCodexSession(t *testing.T, idx int, got, want model.SessionInfo) {
 	if got.GitBranch != want.GitBranch {
 		t.Errorf("session[%d].GitBranch = %q, want %q", idx, got.GitBranch, want.GitBranch)
 	}
+	if got.InputTokens != want.InputTokens {
+		t.Errorf("session[%d].InputTokens = %d, want %d", idx, got.InputTokens, want.InputTokens)
+	}
 }
 
 // writeSessionIndexJSONL writes a session_index.jsonl file.
@@ -171,12 +174,13 @@ func TestCodexScanner_Scan(t *testing.T) {
 			},
 			sessions: []model.SessionInfo{
 				{
-					ID:         "thread-001",
-					Provider:   model.ProviderCodex,
-					Status:     model.StatusActive,
-					Title:      "Fix auth flow",
-					ProjectDir: "/home/user/project",
-					GitBranch:  "feat/auth",
+					ID:          "thread-001",
+					Provider:    model.ProviderCodex,
+					Status:      model.StatusActive,
+					Title:       "Fix auth flow",
+					InputTokens: 5000,
+					ProjectDir:  "/home/user/project",
+					GitBranch:   "feat/auth",
 				},
 			},
 		},
@@ -197,12 +201,13 @@ func TestCodexScanner_Scan(t *testing.T) {
 			},
 			sessions: []model.SessionInfo{
 				{
-					ID:         "thread-002",
-					Provider:   model.ProviderCodex,
-					Status:     model.StatusIdle,
-					Title:      "Refactor DB layer",
-					ProjectDir: "/home/user/backend",
-					GitBranch:  "refactor/db",
+					ID:          "thread-002",
+					Provider:    model.ProviderCodex,
+					Status:      model.StatusIdle,
+					Title:       "Refactor DB layer",
+					InputTokens: 8000,
+					ProjectDir:  "/home/user/backend",
+					GitBranch:   "refactor/db",
 				},
 			},
 		},
@@ -223,12 +228,13 @@ func TestCodexScanner_Scan(t *testing.T) {
 			},
 			sessions: []model.SessionInfo{
 				{
-					ID:         "thread-003",
-					Provider:   model.ProviderCodex,
-					Status:     model.StatusFinished,
-					Title:      "Old task",
-					ProjectDir: "/home/user/legacy",
-					GitBranch:  "main",
+					ID:          "thread-003",
+					Provider:    model.ProviderCodex,
+					Status:      model.StatusFinished,
+					Title:       "Old task",
+					InputTokens: 12000,
+					ProjectDir:  "/home/user/legacy",
+					GitBranch:   "main",
 				},
 			},
 		},
