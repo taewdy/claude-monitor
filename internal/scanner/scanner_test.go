@@ -33,13 +33,13 @@ func TestScanner_Scan(t *testing.T) {
 					PID:       999999999,
 					SessionID: "s1",
 					Cwd:       "/tmp/proj1",
-					StartedAt: startedAt.Format(time.RFC3339),
+					StartedAt: startedAt.UnixMilli(),
 				})
 				writeSessionFile(t, homeDir, "s2.json", sessionFile{
 					PID:       999999998,
 					SessionID: "s2",
 					Cwd:       "/tmp/proj2",
-					StartedAt: startedAt.Format(time.RFC3339),
+					StartedAt: startedAt.UnixMilli(),
 				})
 			},
 			sessionCount: 2,
@@ -97,7 +97,7 @@ func TestScanner_Scan_SortedByLastActiveDesc(t *testing.T) {
 			PID:       999999999 - i,
 			SessionID: sids[i],
 			Cwd:       cwds[i],
-			StartedAt: startedAt.Format(time.RFC3339),
+			StartedAt: startedAt.UnixMilli(),
 		})
 		encoded := encodeCwd(cwds[i])
 		writeConversationJSONL(t, homeDir, encoded, sids[i], []jsonlMessage{
@@ -140,7 +140,7 @@ func TestScanner_Scan_ConcurrencySafe(t *testing.T) {
 			PID:       999999990 + i,
 			SessionID: sid,
 			Cwd:       "/tmp",
-			StartedAt: startedAt.Format(time.RFC3339),
+			StartedAt: startedAt.UnixMilli(),
 		})
 	}
 

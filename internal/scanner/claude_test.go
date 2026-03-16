@@ -19,7 +19,7 @@ type sessionFile struct {
 	PID       int    `json:"pid"`
 	SessionID string `json:"sessionId"`
 	Cwd       string `json:"cwd"`
-	StartedAt string `json:"startedAt"`
+	StartedAt int64  `json:"startedAt"`
 }
 
 // jsonlMessage represents a single line in a conversation JSONL file.
@@ -192,7 +192,7 @@ func TestClaudeScanner_Scan(t *testing.T) {
 					PID:       999999999,
 					SessionID: sid,
 					Cwd:       cwd,
-					StartedAt: startedAt.Format(time.RFC3339),
+					StartedAt: startedAt.UnixMilli(),
 				})
 				encoded := encodeCwd(cwd)
 				writeConversationJSONL(t, homeDir, encoded, sid, []jsonlMessage{
@@ -243,7 +243,7 @@ func TestClaudeScanner_Scan(t *testing.T) {
 					PID:       999999999,
 					SessionID: "sess-no-conv",
 					Cwd:       "/tmp/proj",
-					StartedAt: startedAt.Format(time.RFC3339),
+					StartedAt: startedAt.UnixMilli(),
 				})
 			},
 			wants: wants{
@@ -269,7 +269,7 @@ func TestClaudeScanner_Scan(t *testing.T) {
 					PID:       999999999,
 					SessionID: sid,
 					Cwd:       cwd,
-					StartedAt: startedAt.Format(time.RFC3339),
+					StartedAt: startedAt.UnixMilli(),
 				})
 				encoded := encodeCwd(cwd)
 				writeConversationJSONL(t, homeDir, encoded, sid, []jsonlMessage{
@@ -302,7 +302,7 @@ func TestClaudeScanner_Scan(t *testing.T) {
 						PID:       999999999 - i,
 						SessionID: sid,
 						Cwd:       cwd,
-						StartedAt: startedAt.Format(time.RFC3339),
+						StartedAt: startedAt.UnixMilli(),
 					})
 				}
 			},
@@ -356,7 +356,7 @@ func TestClaudeScanner_Scan(t *testing.T) {
 					PID:       999999999,
 					SessionID: sid,
 					Cwd:       cwd,
-					StartedAt: startedAt.Format(time.RFC3339),
+					StartedAt: startedAt.UnixMilli(),
 				})
 				encoded := encodeCwd(cwd)
 				writeConversationJSONL(t, homeDir, encoded, sid, []jsonlMessage{
@@ -396,7 +396,7 @@ func TestClaudeScanner_Scan(t *testing.T) {
 					PID:       999999999,
 					SessionID: sid,
 					Cwd:       cwd,
-					StartedAt: startedAt.Format(time.RFC3339),
+					StartedAt: startedAt.UnixMilli(),
 				})
 				encoded := encodeCwd(cwd)
 				// Write JSONL manually with some bad lines interspersed.
@@ -448,7 +448,7 @@ func TestClaudeScanner_Scan(t *testing.T) {
 					PID:       999999999,
 					SessionID: sid,
 					Cwd:       cwd,
-					StartedAt: startedAt.Format(time.RFC3339),
+					StartedAt: startedAt.UnixMilli(),
 				})
 				encoded := encodeCwd(cwd)
 				dir := filepath.Join(homeDir, ".claude", "projects", encoded)
@@ -485,7 +485,7 @@ func TestClaudeScanner_Scan(t *testing.T) {
 					PID:       999999999,
 					SessionID: "sess-cancel",
 					Cwd:       "/tmp",
-					StartedAt: startedAt.Format(time.RFC3339),
+					StartedAt: startedAt.UnixMilli(),
 				})
 			},
 			wants: wants{
@@ -556,7 +556,7 @@ func TestClaudeScanner_StatusDetermination(t *testing.T) {
 		cwd := "/tmp/" + sid
 		writeSessionFile(t, homeDir, sid+".json", sessionFile{
 			PID: pid, SessionID: sid, Cwd: cwd,
-			StartedAt: startedAt.Format(time.RFC3339),
+			StartedAt: startedAt.UnixMilli(),
 		})
 		if len(msgs) > 0 {
 			writeConversationJSONL(t, homeDir, encodeCwd(cwd), sid, msgs)
@@ -659,7 +659,7 @@ func TestClaudeScanner_TailParsing(t *testing.T) {
 				PID:       999999999,
 				SessionID: sid,
 				Cwd:       cwd,
-				StartedAt: startedAt.Format(time.RFC3339),
+				StartedAt: startedAt.UnixMilli(),
 			})
 
 			messages := make([]jsonlMessage, tt.totalLines)
@@ -733,7 +733,7 @@ func TestClaudeScanner_SlugTitle(t *testing.T) {
 				PID:       999999999,
 				SessionID: sid,
 				Cwd:       cwd,
-				StartedAt: startedAt.Format(time.RFC3339),
+				StartedAt: startedAt.UnixMilli(),
 			})
 
 			encoded := encodeCwd(cwd)
@@ -770,7 +770,7 @@ func TestClaudeScanner_EncodedCwdPath(t *testing.T) {
 				PID:       999999999,
 				SessionID: sid,
 				Cwd:       cwd,
-				StartedAt: startedAt.Format(time.RFC3339),
+				StartedAt: startedAt.UnixMilli(),
 			})
 
 			encoded := encodeCwd(cwd)

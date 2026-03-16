@@ -76,16 +76,13 @@ func (c *claudeScanner) processSessionFile(path string) (model.SessionInfo, bool
 		PID       int    `json:"pid"`
 		SessionID string `json:"sessionId"`
 		Cwd       string `json:"cwd"`
-		StartedAt string `json:"startedAt"`
+		StartedAt int64  `json:"startedAt"`
 	}
 	if err := json.Unmarshal(data, &sf); err != nil {
 		return model.SessionInfo{}, false
 	}
 
-	startedAt, err := time.Parse(time.RFC3339, sf.StartedAt)
-	if err != nil {
-		return model.SessionInfo{}, false
-	}
+	startedAt := time.UnixMilli(sf.StartedAt)
 
 	info := model.SessionInfo{
 		ID:         sf.SessionID,
