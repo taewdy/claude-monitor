@@ -18,20 +18,36 @@ import (
 func main() {
 	addr := flag.String("addr", ":8555", "HTTP listen address")
 	slackWebhook := flag.String("slack-webhook", "", "Slack incoming webhook URL")
+	teamsWebhook := flag.String("teams-webhook", "", "Microsoft Teams incoming webhook URL")
 	poll := flag.Duration("poll", 5*time.Second, "polling interval")
 	flag.Parse()
 
-	// Resolve webhook URL: CLI flag takes precedence over env var.
-	webhookURL := *slackWebhook
-	if webhookURL == "" {
-		webhookURL = os.Getenv("SLACK_WEBHOOK_URL")
+	// Resolve webhook URLs: CLI flag takes precedence over env var.
+	slackURL := *slackWebhook
+	if slackURL == "" {
+		slackURL = os.Getenv("SLACK_WEBHOOK_URL")
+	}
+	teamsURL := *teamsWebhook
+	if teamsURL == "" {
+		teamsURL = os.Getenv("TEAMS_WEBHOOK_URL")
+	}
+
+	var notifiers []notify.Notifier
+	if slackURL != "" {
+		notifiers = append(notifiers, notify.NewSlackNotifier(slackURL))
+	}
+	if teamsURL != "" {
+		notifiers = append(notifiers, notify.NewTeamsNotifier(teamsURL))
 	}
 
 	var notifier notify.Notifier
-	if webhookURL != "" {
-		notifier = notify.NewSlackNotifier(webhookURL)
-	} else {
+	switch len(notifiers) {
+	case 0:
 		notifier = &notify.NoopNotifier{}
+	case 1:
+		notifier = notifiers[0]
+	default:
+		notifier = notify.NewMultiNotifier(notifiers...)
 	}
 
 	sc := scanner.New()
