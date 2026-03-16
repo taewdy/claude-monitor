@@ -134,21 +134,19 @@ func (m *Monitor) poll(ctx context.Context) {
 	for _, s := range sessions {
 		old, existed := m.prev[s.ID]
 		if !existed {
-			// New sessions notify immediately (no debounce).
-			m.sendNotify(ctx, notify.StatusChange{
-				Session:   s,
-				OldStatus: "",
-				NewStatus: s.Status,
-			})
+			// New sessions: no notification (not transitioning out of active).
 		} else if old != s.Status {
 			// Status changed — check if this matches a pending change.
 			if pend, ok := m.pending[s.ID]; ok && pend == s.Status {
 				// Confirmed: same new status seen twice in a row.
-				m.sendNotify(ctx, notify.StatusChange{
-					Session:   s,
-					OldStatus: old,
-					NewStatus: s.Status,
-				})
+				// Only notify when transitioning out of active status.
+				if old == model.StatusActive {
+					m.sendNotify(ctx, notify.StatusChange{
+						Session:   s,
+						OldStatus: old,
+						NewStatus: s.Status,
+					})
+				}
 				delete(m.pending, s.ID)
 			} else {
 				// First time seeing this new status — record as pending.
@@ -160,14 +158,16 @@ func (m *Monitor) poll(ctx context.Context) {
 		}
 	}
 
-	// Detect disappeared sessions (notify immediately).
+	// Detect disappeared sessions (notify only if was active).
 	for id, oldStatus := range m.prev {
 		if _, exists := current[id]; !exists {
-			m.sendNotify(ctx, notify.StatusChange{
-				Session:   model.SessionInfo{ID: id},
-				OldStatus: oldStatus,
-				NewStatus: model.StatusFinished,
-			})
+			if oldStatus == model.StatusActive {
+				m.sendNotify(ctx, notify.StatusChange{
+					Session:   model.SessionInfo{ID: id},
+					OldStatus: oldStatus,
+					NewStatus: model.StatusFinished,
+				})
+			}
 			delete(m.pending, id)
 		}
 	}

@@ -22,6 +22,7 @@ func TestScanner_New(t *testing.T) {
 
 func TestScanner_Scan(t *testing.T) {
 	startedAt := time.Now().UTC().Add(-1 * time.Hour).Truncate(time.Second)
+	staleTimestamp := time.Now().UTC().Add(-5 * time.Minute).Truncate(time.Second)
 
 	tests := map[string]struct {
 		buildFS      func(t *testing.T, homeDir string)
@@ -29,17 +30,24 @@ func TestScanner_Scan(t *testing.T) {
 	}{
 		"returns_sessions_from_claude_scanner": {
 			buildFS: func(t *testing.T, homeDir string) {
-				writeSessionFile(t, homeDir, "s1.json", sessionFile{
+				// Session files + JSONL files (scanner is JSONL-first).
+				writeSessionFile(t, homeDir, "999999999.json", sessionFile{
 					PID:       999999999,
 					SessionID: "s1",
 					Cwd:       "/tmp/proj1",
 					StartedAt: startedAt.UnixMilli(),
 				})
-				writeSessionFile(t, homeDir, "s2.json", sessionFile{
+				writeConversationJSONL(t, homeDir, encodeCwd("/tmp/proj1"), "s1", []jsonlMessage{
+					mkMsg("user", staleTimestamp, nil),
+				})
+				writeSessionFile(t, homeDir, "999999998.json", sessionFile{
 					PID:       999999998,
 					SessionID: "s2",
 					Cwd:       "/tmp/proj2",
 					StartedAt: startedAt.UnixMilli(),
+				})
+				writeConversationJSONL(t, homeDir, encodeCwd("/tmp/proj2"), "s2", []jsonlMessage{
+					mkMsg("user", staleTimestamp, nil),
 				})
 			},
 			sessionCount: 2,
@@ -93,7 +101,7 @@ func TestScanner_Scan_SortedByLastActiveDesc(t *testing.T) {
 	lastActives := []time.Duration{-10 * time.Minute, -5 * time.Minute, -1 * time.Minute}
 
 	for i := range sids {
-		writeSessionFile(t, homeDir, sids[i]+".json", sessionFile{
+		writeSessionFile(t, homeDir, fmt.Sprintf("%d.json", 999999999-i), sessionFile{
 			PID:       999999999 - i,
 			SessionID: sids[i],
 			Cwd:       cwds[i],
@@ -133,14 +141,19 @@ func TestScanner_Scan_SortedByLastActiveDesc(t *testing.T) {
 func TestScanner_Scan_ConcurrencySafe(t *testing.T) {
 	homeDir := t.TempDir()
 	startedAt := time.Now().UTC().Add(-1 * time.Hour).Truncate(time.Second)
+	staleTimestamp := time.Now().UTC().Add(-5 * time.Minute).Truncate(time.Second)
 
 	for i := range 5 {
 		sid := fmt.Sprintf("sess-race-%d", i)
-		writeSessionFile(t, homeDir, sid+".json", sessionFile{
+		cwd := "/tmp"
+		writeSessionFile(t, homeDir, fmt.Sprintf("%d.json", 999999990+i), sessionFile{
 			PID:       999999990 + i,
 			SessionID: sid,
-			Cwd:       "/tmp",
+			Cwd:       cwd,
 			StartedAt: startedAt.UnixMilli(),
+		})
+		writeConversationJSONL(t, homeDir, encodeCwd(cwd), sid, []jsonlMessage{
+			mkMsg("user", staleTimestamp, nil),
 		})
 	}
 

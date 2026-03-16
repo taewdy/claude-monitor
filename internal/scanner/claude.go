@@ -17,8 +17,9 @@ import (
 
 const tailLines = 50
 
-// claudeScanner discovers Claude Code sessions by reading session files
-// from ~/.claude/sessions/ and correlating them with conversation JSONL files.
+// claudeScanner discovers Claude Code sessions by scanning JSONL conversation
+// files in ~/.claude/projects/*/. Session files in ~/.claude/sessions/ are used
+// as a secondary source for PID and startedAt enrichment.
 type claudeScanner struct {
 	// homeDir is the user's home directory, injected for testability.
 	homeDir string
@@ -29,10 +30,56 @@ func newClaudeScanner(homeDir string) *claudeScanner {
 	return &claudeScanner{homeDir: homeDir}
 }
 
-// scan discovers all Claude Code sessions and returns their info.
-func (c *claudeScanner) scan(ctx context.Context) ([]model.SessionInfo, error) {
+// sessionFileData holds the fields parsed from a session JSON file.
+type sessionFileData struct {
+	PID       int
+	Cwd       string
+	StartedAt time.Time
+}
+
+// buildSessionIndex reads all ~/.claude/sessions/*.json files and returns
+// a map from sessionId to session file data.
+func (c *claudeScanner) buildSessionIndex() map[string]sessionFileData {
 	sessDir := filepath.Join(c.homeDir, ".claude", "sessions")
 	entries, err := os.ReadDir(sessDir)
+	if err != nil {
+		return nil
+	}
+
+	index := make(map[string]sessionFileData, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(sessDir, entry.Name()))
+		if err != nil {
+			continue
+		}
+		var sf struct {
+			PID       int    `json:"pid"`
+			SessionID string `json:"sessionId"`
+			Cwd       string `json:"cwd"`
+			StartedAt int64  `json:"startedAt"`
+		}
+		if err := json.Unmarshal(data, &sf); err != nil {
+			continue
+		}
+		index[sf.SessionID] = sessionFileData{
+			PID:       sf.PID,
+			Cwd:       sf.Cwd,
+			StartedAt: time.UnixMilli(sf.StartedAt),
+		}
+	}
+	return index
+}
+
+// scan discovers all Claude Code sessions by scanning JSONL files across
+// all project directories, enriching with PID data from session files.
+func (c *claudeScanner) scan(ctx context.Context) ([]model.SessionInfo, error) {
+	sessionIndex := c.buildSessionIndex()
+
+	projectsDir := filepath.Join(c.homeDir, ".claude", "projects")
+	projEntries, err := os.ReadDir(projectsDir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
@@ -41,81 +88,69 @@ func (c *claudeScanner) scan(ctx context.Context) ([]model.SessionInfo, error) {
 	}
 
 	var sessions []model.SessionInfo
-	for _, entry := range entries {
+	for _, projEntry := range projEntries {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		default:
 		}
 
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+		if !projEntry.IsDir() {
 			continue
 		}
 
-		info, ok := c.processSessionFile(filepath.Join(sessDir, entry.Name()))
-		if !ok {
+		projPath := filepath.Join(projectsDir, projEntry.Name())
+		jsonlFiles, err := os.ReadDir(projPath)
+		if err != nil {
 			continue
 		}
-		sessions = append(sessions, info)
+
+		for _, jf := range jsonlFiles {
+			if jf.IsDir() || !strings.HasSuffix(jf.Name(), ".jsonl") {
+				continue
+			}
+
+			sessionID := strings.TrimSuffix(jf.Name(), ".jsonl")
+			jsonlPath := filepath.Join(projPath, jf.Name())
+
+			info := model.SessionInfo{
+				ID:       sessionID,
+				Provider: model.ProviderClaude,
+			}
+
+			// Enrich from session file if available.
+			if sf, ok := sessionIndex[sessionID]; ok {
+				info.PID = sf.PID
+				info.StartedAt = sf.StartedAt
+				info.ProjectDir = sf.Cwd
+			}
+
+			// Parse JSONL for message stats, tokens, title, cwd.
+			lastRole := c.parseConversation(jsonlPath, &info)
+
+			// Count subagents.
+			subagentDir := filepath.Join(projPath, sessionID, "subagents")
+			if entries, err := os.ReadDir(subagentDir); err == nil {
+				info.SubagentCount = len(entries)
+			}
+
+			// Get JSONL file modification time for status detection.
+			var jsonlMtime time.Time
+			if fi, err := os.Stat(jsonlPath); err == nil {
+				jsonlMtime = fi.ModTime()
+			}
+
+			info.Status = c.determineStatus(info.PID, jsonlMtime, lastRole)
+
+			sessions = append(sessions, info)
+		}
 	}
 
 	return sessions, nil
 }
 
-// processSessionFile reads and parses a single session JSON file, correlates
-// it with its conversation JSONL, and returns a populated SessionInfo.
-// Returns false if the file should be skipped.
-func (c *claudeScanner) processSessionFile(path string) (model.SessionInfo, bool) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return model.SessionInfo{}, false
-	}
-
-	var sf struct {
-		PID       int    `json:"pid"`
-		SessionID string `json:"sessionId"`
-		Cwd       string `json:"cwd"`
-		StartedAt int64  `json:"startedAt"`
-	}
-	if err := json.Unmarshal(data, &sf); err != nil {
-		return model.SessionInfo{}, false
-	}
-
-	startedAt := time.UnixMilli(sf.StartedAt)
-
-	info := model.SessionInfo{
-		ID:         sf.SessionID,
-		Provider:   model.ProviderClaude,
-		ProjectDir: sf.Cwd,
-		StartedAt:  startedAt,
-		PID:        sf.PID,
-	}
-
-	// Parse conversation JSONL for message stats.
-	encoded := strings.ReplaceAll(sf.Cwd, "/", "-")
-	jsonlPath := filepath.Join(c.homeDir, ".claude", "projects", encoded, sf.SessionID+".jsonl")
-	lastRole := c.parseConversation(jsonlPath, &info)
-
-	// Count subagents.
-	subagentDir := filepath.Join(c.homeDir, ".claude", "projects", encoded, sf.SessionID, "subagents")
-	if entries, err := os.ReadDir(subagentDir); err == nil {
-		info.SubagentCount = len(entries)
-	}
-
-	// Get JSONL file modification time for freshness-based status detection.
-	var jsonlMtime time.Time
-	if fi, err := os.Stat(jsonlPath); err == nil {
-		jsonlMtime = fi.ModTime()
-	}
-
-	// Determine status using file mtime (not content timestamps).
-	info.Status = c.determineStatus(sf.PID, jsonlMtime, lastRole)
-
-	return info, true
-}
-
 // parseConversation reads the tail of a JSONL conversation file and populates
-// the SessionInfo with message counts, token usage, title, and last active time.
+// the SessionInfo with message counts, token usage, title, cwd, and last active time.
 // Returns the role of the last successfully parsed message.
 func (c *claudeScanner) parseConversation(path string, info *model.SessionInfo) string {
 	f, err := os.Open(path)
@@ -132,6 +167,7 @@ func (c *claudeScanner) parseConversation(path string, info *model.SessionInfo) 
 			Type      string    `json:"type"`
 			Timestamp time.Time `json:"timestamp"`
 			Slug      string    `json:"slug,omitempty"`
+			Cwd       string    `json:"cwd,omitempty"`
 			Message   *struct {
 				Role  string `json:"role"`
 				Usage *struct {
@@ -154,9 +190,17 @@ func (c *claudeScanner) parseConversation(path string, info *model.SessionInfo) 
 
 		if !msg.Timestamp.IsZero() {
 			info.LastActive = msg.Timestamp
+			// Use earliest timestamp as StartedAt if not set from session file.
+			if info.StartedAt.IsZero() {
+				info.StartedAt = msg.Timestamp
+			}
 		}
 		if msg.Slug != "" {
 			info.Title = msg.Slug
+		}
+		// Extract cwd from user messages if not already set from session file.
+		if info.ProjectDir == "" && msg.Cwd != "" {
+			info.ProjectDir = msg.Cwd
 		}
 		if msg.Message != nil && msg.Message.Usage != nil {
 			u := msg.Message.Usage
@@ -186,15 +230,16 @@ func readTailLines(r io.Reader, n int) []string {
 	return ring[len(ring)-n:]
 }
 
-// determineStatus applies the status rules using JSONL file mtime as the
-// sole activity signal:
-//  1. PID dead → finished
-//  2. PID alive + JSONL file modified within 2 min → active
-//  3. PID alive + mtime is zero (no JSONL file) → active (brand new session)
-//  4. PID alive + last role "assistant" → waiting
-//  5. default → idle
+// determineStatus applies the status rules using JSONL file mtime and PID:
+//  1. PID known and dead → finished
+//  2. JSONL file modified within 2 min → active
+//  3. JSONL mtime is zero (no file) + PID alive → active (brand new)
+//  4. JSONL mtime is zero + no PID → finished
+//  5. Stale JSONL + no PID → finished (e.g. claude -p that completed)
+//  6. Stale JSONL + PID alive + last role "assistant" → waiting
+//  7. Stale JSONL + PID alive → idle
 func (c *claudeScanner) determineStatus(pid int, jsonlMtime time.Time, lastRole string) model.Status {
-	if !isProcessAlive(pid) {
+	if pid > 0 && !isProcessAlive(pid) {
 		return model.StatusFinished
 	}
 
@@ -203,7 +248,15 @@ func (c *claudeScanner) determineStatus(pid int, jsonlMtime time.Time, lastRole 
 	}
 
 	if jsonlMtime.IsZero() {
-		return model.StatusActive
+		if pid > 0 && isProcessAlive(pid) {
+			return model.StatusActive
+		}
+		return model.StatusFinished
+	}
+
+	// Stale mtime with no known PID — assume finished.
+	if pid == 0 {
+		return model.StatusFinished
 	}
 
 	if lastRole == "assistant" {

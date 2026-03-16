@@ -28,6 +28,7 @@ type jsonlMessage struct {
 	Type      string         `json:"type"`
 	Timestamp time.Time      `json:"timestamp"`
 	Slug      string         `json:"slug,omitempty"`
+	Cwd       string         `json:"cwd,omitempty"`
 	Message   *nestedMessage `json:"message,omitempty"`
 }
 
@@ -50,6 +51,13 @@ func mkMsg(role string, ts time.Time, u *usage) jsonlMessage {
 		Timestamp: ts,
 		Message:   &nestedMessage{Role: role, Usage: u},
 	}
+}
+
+// mkMsgWithCwd creates a jsonlMessage with a cwd field (like real user messages have).
+func mkMsgWithCwd(role string, ts time.Time, u *usage, cwd string) jsonlMessage {
+	m := mkMsg(role, ts, u)
+	m.Cwd = cwd
+	return m
 }
 
 // mkMsgSlug creates a jsonlMessage with a slug/title.
@@ -199,15 +207,15 @@ func TestClaudeScanner_Scan(t *testing.T) {
 		buildFS func(t *testing.T, homeDir string)
 		wants   wants
 	}{
-		"no_sessions_directory": {
+		"no_projects_directory": {
 			wants: wants{
 				count:  0,
 				errNil: true,
 			},
 		},
-		"empty_sessions_directory": {
+		"empty_projects_directory": {
 			buildFS: func(t *testing.T, homeDir string) {
-				dir := filepath.Join(homeDir, ".claude", "sessions")
+				dir := filepath.Join(homeDir, ".claude", "projects")
 				if err := os.MkdirAll(dir, 0o755); err != nil {
 					t.Fatal(err)
 				}
@@ -217,11 +225,11 @@ func TestClaudeScanner_Scan(t *testing.T) {
 				errNil: true,
 			},
 		},
-		"single_finished_session_with_conversation": {
+		"finished_session_with_conversation": {
 			buildFS: func(t *testing.T, homeDir string) {
 				cwd := "/home/user/myproject"
 				sid := "sess-abc-123"
-				writeSessionFile(t, homeDir, sid+".json", sessionFile{
+				writeSessionFile(t, homeDir, "999999999.json", sessionFile{
 					PID:       999999999,
 					SessionID: sid,
 					Cwd:       cwd,
@@ -252,39 +260,29 @@ func TestClaudeScanner_Scan(t *testing.T) {
 				errNil: true,
 			},
 		},
-		"malformed_session_json_skipped": {
+		"jsonl_without_session_file": {
 			buildFS: func(t *testing.T, homeDir string) {
-				dir := filepath.Join(homeDir, ".claude", "sessions")
-				if err := os.MkdirAll(dir, 0o755); err != nil {
-					t.Fatal(err)
-				}
-				if err := os.WriteFile(filepath.Join(dir, "bad.json"), []byte("{invalid json!!!"), 0o644); err != nil {
-					t.Fatal(err)
-				}
-			},
-			wants: wants{
-				count:  0,
-				errNil: true,
-			},
-		},
-		"session_with_missing_conversation_jsonl": {
-			buildFS: func(t *testing.T, homeDir string) {
-				writeSessionFile(t, homeDir, "sess-no-conv.json", sessionFile{
-					PID:       999999999,
-					SessionID: "sess-no-conv",
-					Cwd:       "/tmp/proj",
-					StartedAt: startedAt.UnixMilli(),
+				cwd := "/home/user/myproject"
+				sid := "sess-orphan-001"
+				encoded := encodeCwd(cwd)
+				writeConversationJSONL(t, homeDir, encoded, sid, []jsonlMessage{
+					mkMsgWithCwd("user", staleTimestamp.Add(-1*time.Minute), &usage{InputTokens: 100, OutputTokens: 0}, cwd),
+					mkMsg("assistant", staleTimestamp, &usage{InputTokens: 0, OutputTokens: 200}),
 				})
+				setFileMtime(t, homeDir, sid, cwd, staleTimestamp)
 			},
 			wants: wants{
 				sessions: []model.SessionInfo{
 					{
-						ID:         "sess-no-conv",
-						Provider:   model.ProviderClaude,
-						Status:     model.StatusFinished,
-						ProjectDir: "/tmp/proj",
-						StartedAt:  startedAt,
-						PID:        999999999,
+						ID:           "sess-orphan-001",
+						Provider:     model.ProviderClaude,
+						Status:       model.StatusFinished, // no PID, stale → finished
+						ProjectDir:   "/home/user/myproject",
+						StartedAt:    staleTimestamp.Add(-1 * time.Minute), // from first timestamp
+						LastActive:   staleTimestamp,
+						InputTokens:  100,
+						OutputTokens: 200,
+						MessageCount: 2,
 					},
 				},
 				errNil: true,
@@ -295,7 +293,7 @@ func TestClaudeScanner_Scan(t *testing.T) {
 				cwd := "/home/user/proj"
 				sid := "sess-sub-001"
 				ts := startedAt.Add(1 * time.Minute)
-				writeSessionFile(t, homeDir, sid+".json", sessionFile{
+				writeSessionFile(t, homeDir, "999999999.json", sessionFile{
 					PID:       999999999,
 					SessionID: sid,
 					Cwd:       cwd,
@@ -324,15 +322,13 @@ func TestClaudeScanner_Scan(t *testing.T) {
 				errNil: true,
 			},
 		},
-		"multiple_sessions": {
+		"multiple_jsonl_files_in_project": {
 			buildFS: func(t *testing.T, homeDir string) {
+				cwd := "/home/user/multi"
+				encoded := encodeCwd(cwd)
 				for i, sid := range []string{"sess-001", "sess-002", "sess-003"} {
-					cwd := fmt.Sprintf("/proj/%d", i)
-					writeSessionFile(t, homeDir, sid+".json", sessionFile{
-						PID:       999999999 - i,
-						SessionID: sid,
-						Cwd:       cwd,
-						StartedAt: startedAt.UnixMilli(),
+					writeConversationJSONL(t, homeDir, encoded, sid, []jsonlMessage{
+						mkMsgWithCwd("user", staleTimestamp.Add(time.Duration(i)*time.Second), nil, cwd),
 					})
 				}
 			},
@@ -341,32 +337,13 @@ func TestClaudeScanner_Scan(t *testing.T) {
 				errNil: true,
 			},
 		},
-		"non_json_files_in_sessions_dir_ignored": {
+		"non_jsonl_files_in_project_dir_ignored": {
 			buildFS: func(t *testing.T, homeDir string) {
-				dir := filepath.Join(homeDir, ".claude", "sessions")
+				dir := filepath.Join(homeDir, ".claude", "projects", "some-project")
 				if err := os.MkdirAll(dir, 0o755); err != nil {
 					t.Fatal(err)
 				}
 				if err := os.WriteFile(filepath.Join(dir, "readme.txt"), []byte("not a session"), 0o644); err != nil {
-					t.Fatal(err)
-				}
-				if err := os.WriteFile(filepath.Join(dir, ".hidden"), []byte("{}"), 0o644); err != nil {
-					t.Fatal(err)
-				}
-			},
-			wants: wants{
-				count:  0,
-				errNil: true,
-			},
-		},
-		"session_with_invalid_started_at": {
-			buildFS: func(t *testing.T, homeDir string) {
-				dir := filepath.Join(homeDir, ".claude", "sessions")
-				if err := os.MkdirAll(dir, 0o755); err != nil {
-					t.Fatal(err)
-				}
-				data := `{"pid":999999999,"sessionId":"sess-bad-time","cwd":"/tmp","startedAt":"not-a-date"}`
-				if err := os.WriteFile(filepath.Join(dir, "sess-bad-time.json"), []byte(data), 0o644); err != nil {
 					t.Fatal(err)
 				}
 			},
@@ -379,7 +356,7 @@ func TestClaudeScanner_Scan(t *testing.T) {
 			buildFS: func(t *testing.T, homeDir string) {
 				cwd := "/home/user/tokens"
 				sid := "sess-tokens"
-				writeSessionFile(t, homeDir, sid+".json", sessionFile{
+				writeSessionFile(t, homeDir, "999999999.json", sessionFile{
 					PID:       999999999,
 					SessionID: sid,
 					Cwd:       cwd,
@@ -415,14 +392,13 @@ func TestClaudeScanner_Scan(t *testing.T) {
 			buildFS: func(t *testing.T, homeDir string) {
 				cwd := "/home/user/badlines"
 				sid := "sess-bad-jsonl"
-				writeSessionFile(t, homeDir, sid+".json", sessionFile{
+				writeSessionFile(t, homeDir, "999999999.json", sessionFile{
 					PID:       999999999,
 					SessionID: sid,
 					Cwd:       cwd,
 					StartedAt: startedAt.UnixMilli(),
 				})
 				encoded := encodeCwd(cwd)
-				// Write JSONL manually with some bad lines interspersed.
 				dir := filepath.Join(homeDir, ".claude", "projects", encoded)
 				if err := os.MkdirAll(dir, 0o755); err != nil {
 					t.Fatal(err)
@@ -432,14 +408,11 @@ func TestClaudeScanner_Scan(t *testing.T) {
 					t.Fatal(err)
 				}
 				defer f.Close()
-				// Valid line
 				validMsg := mkMsg("user", staleTimestamp, &usage{InputTokens: 100, OutputTokens: 0})
 				validData, _ := json.Marshal(validMsg)
 				f.Write(validData)
 				f.WriteString("\n")
-				// Malformed line
 				f.WriteString("{this is not valid json\n")
-				// Another valid line
 				validMsg2 := mkMsg("assistant", staleTimestamp.Add(time.Second), &usage{InputTokens: 0, OutputTokens: 200})
 				validData2, _ := json.Marshal(validMsg2)
 				f.Write(validData2)
@@ -456,7 +429,7 @@ func TestClaudeScanner_Scan(t *testing.T) {
 						LastActive:   staleTimestamp.Add(time.Second),
 						InputTokens:  100,
 						OutputTokens: 200,
-						MessageCount: 2, // only the 2 valid lines
+						MessageCount: 2,
 						PID:          999999999,
 					},
 				},
@@ -467,7 +440,7 @@ func TestClaudeScanner_Scan(t *testing.T) {
 			buildFS: func(t *testing.T, homeDir string) {
 				cwd := "/home/user/empty-conv"
 				sid := "sess-empty-jsonl"
-				writeSessionFile(t, homeDir, sid+".json", sessionFile{
+				writeSessionFile(t, homeDir, "999999999.json", sessionFile{
 					PID:       999999999,
 					SessionID: sid,
 					Cwd:       cwd,
@@ -478,7 +451,6 @@ func TestClaudeScanner_Scan(t *testing.T) {
 				if err := os.MkdirAll(dir, 0o755); err != nil {
 					t.Fatal(err)
 				}
-				// Create empty JSONL file
 				if err := os.WriteFile(filepath.Join(dir, sid+".jsonl"), []byte(""), 0o644); err != nil {
 					t.Fatal(err)
 				}
@@ -504,11 +476,10 @@ func TestClaudeScanner_Scan(t *testing.T) {
 				return ctx
 			}(),
 			buildFS: func(t *testing.T, homeDir string) {
-				writeSessionFile(t, homeDir, "sess-cancel.json", sessionFile{
-					PID:       999999999,
-					SessionID: "sess-cancel",
-					Cwd:       "/tmp",
-					StartedAt: startedAt.UnixMilli(),
+				cwd := "/tmp"
+				encoded := encodeCwd(cwd)
+				writeConversationJSONL(t, homeDir, encoded, "sess-cancel", []jsonlMessage{
+					mkMsg("user", staleTimestamp, nil),
 				})
 			},
 			wants: wants{
@@ -561,28 +532,26 @@ func TestClaudeScanner_Scan(t *testing.T) {
 }
 
 // TestClaudeScanner_StatusDetermination tests the status priority rules:
-//  1. PID dead → finished
-//  2. PID alive + JSONL file modified within 2 min → active
-//  3. PID alive + mtime is zero (no JSONL file) → active (brand new session)
-//  4. PID alive + last role "assistant" → waiting
-//  5. default → idle
-//
-// Tests that need to exercise non-mtime logic (idle, waiting) set the JSONL
-// mtime to 10 min ago via Chtimes so mtime doesn't short-circuit.
-// Tests for mtime-based detection leave the file as-is (just written, fresh mtime).
+//  1. PID known and dead → finished
+//  2. JSONL file modified within 2 min → active
+//  3. JSONL mtime is zero + PID alive → active (brand new)
+//  4. JSONL mtime is zero + no PID → finished
+//  5. Stale JSONL + no PID → finished
+//  6. Stale JSONL + PID alive + last role "assistant" → waiting
+//  7. Stale JSONL + PID alive → idle
 func TestClaudeScanner_StatusDetermination(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	startedAt := now.Add(-1 * time.Hour)
+	staleTimestamp := now.Add(-10 * time.Minute)
 
 	// Use a known-alive PID for tests that need an alive process.
 	alivePID := os.Getpid()
 
-	// makeSession is a helper that writes session + optional JSONL for a given
-	// pid and message list, reducing boilerplate across status test cases.
+	// makeSession writes a session file + JSONL for the given pid and messages.
 	makeSession := func(t *testing.T, homeDir, sid string, pid int, msgs []jsonlMessage) {
 		t.Helper()
 		cwd := "/tmp/" + sid
-		writeSessionFile(t, homeDir, sid+".json", sessionFile{
+		writeSessionFile(t, homeDir, fmt.Sprintf("%d.json", pid), sessionFile{
 			PID: pid, SessionID: sid, Cwd: cwd,
 			StartedAt: startedAt.UnixMilli(),
 		})
@@ -591,19 +560,27 @@ func TestClaudeScanner_StatusDetermination(t *testing.T) {
 		}
 	}
 
+	// makeJSONLOnly writes a JSONL without a session file (like claude -p).
+	makeJSONLOnly := func(t *testing.T, homeDir, sid string, msgs []jsonlMessage, cwd string) {
+		t.Helper()
+		writeConversationJSONL(t, homeDir, encodeCwd(cwd), sid, msgs)
+	}
+
 	tests := map[string]struct {
 		buildFS func(t *testing.T, homeDir string)
 		status  model.Status
 	}{
 		"dead_pid_is_finished": {
 			buildFS: func(t *testing.T, homeDir string) {
-				makeSession(t, homeDir, "dead", 999999999, nil)
+				makeSession(t, homeDir, "dead", 999999999, []jsonlMessage{
+					mkMsg("user", staleTimestamp, nil),
+				})
 			},
 			status: model.StatusFinished,
 		},
 		"alive_pid_recent_file_mtime_is_active": {
 			buildFS: func(t *testing.T, homeDir string) {
-				// File just written, mtime is fresh — no Chtimes needed.
+				// File just written, mtime is fresh.
 				makeSession(t, homeDir, "recent", alivePID, []jsonlMessage{
 					mkMsg("user", now.Add(-3*time.Minute), nil),
 				})
@@ -617,7 +594,6 @@ func TestClaudeScanner_StatusDetermination(t *testing.T) {
 				makeSession(t, homeDir, sid, alivePID, []jsonlMessage{
 					mkMsg("user", now.Add(-10*time.Minute), nil),
 				})
-				// Set mtime to 10 min ago via Chtimes.
 				setFileMtime(t, homeDir, sid, cwd, now.Add(-10*time.Minute))
 			},
 			status: model.StatusIdle,
@@ -630,24 +606,42 @@ func TestClaudeScanner_StatusDetermination(t *testing.T) {
 					mkMsg("user", now.Add(-10*time.Minute), nil),
 					mkMsg("assistant", now.Add(-6*time.Minute), nil),
 				})
-				// Set mtime to 6 min ago via Chtimes.
 				setFileMtime(t, homeDir, sid, cwd, now.Add(-6*time.Minute))
 			},
 			status: model.StatusWaiting,
 		},
-		"alive_pid_no_messages_is_active": {
-			buildFS: func(t *testing.T, homeDir string) {
-				makeSession(t, homeDir, "no-msgs", alivePID, nil)
-			},
-			status: model.StatusActive,
-		},
 		"alive_pid_recent_assistant_msg_within_2min_is_active": {
 			buildFS: func(t *testing.T, homeDir string) {
-				// File just written, mtime is fresh — still active despite assistant last role.
+				// File just written, mtime is fresh.
 				makeSession(t, homeDir, "recent-asst", alivePID, []jsonlMessage{
 					mkMsg("user", now.Add(-4*time.Minute), nil),
 					mkMsg("assistant", now.Add(-2*time.Minute), nil),
 				})
+			},
+			status: model.StatusActive,
+		},
+		"no_pid_stale_mtime_is_finished": {
+			buildFS: func(t *testing.T, homeDir string) {
+				// Orphan JSONL (like claude -p that completed).
+				sid := "orphan"
+				cwd := "/tmp/" + sid
+				makeJSONLOnly(t, homeDir, sid, []jsonlMessage{
+					mkMsgWithCwd("user", staleTimestamp, nil, cwd),
+					mkMsg("assistant", staleTimestamp.Add(time.Second), nil),
+				}, cwd)
+				setFileMtime(t, homeDir, sid, cwd, staleTimestamp)
+			},
+			status: model.StatusFinished,
+		},
+		"no_pid_fresh_mtime_is_active": {
+			buildFS: func(t *testing.T, homeDir string) {
+				// Orphan JSONL being actively written (claude -p in progress).
+				sid := "orphan-active"
+				cwd := "/tmp/" + sid
+				makeJSONLOnly(t, homeDir, sid, []jsonlMessage{
+					mkMsgWithCwd("user", now, nil, cwd),
+				}, cwd)
+				// Don't set mtime — file was just created, mtime is fresh.
 			},
 			status: model.StatusActive,
 		},
@@ -685,12 +679,10 @@ func TestClaudeScanner_TailParsing(t *testing.T) {
 	}{
 		"small_file_all_lines_parsed": {
 			totalLines:   10,
-			inputTokens:  10 * 10, // 10 per line
-			outputTokens: 10 * 20, // 20 per line
+			inputTokens:  10 * 10,
+			outputTokens: 10 * 20,
 		},
 		"large_file_only_tail_parsed": {
-			// Only the last ~50 lines should be parsed.
-			// Token totals should reflect ~50 lines, not all 100.
 			totalLines:   100,
 			inputTokens:  50 * 10,
 			outputTokens: 50 * 20,
@@ -708,7 +700,7 @@ func TestClaudeScanner_TailParsing(t *testing.T) {
 			cwd := "/tmp/tail-test"
 			sid := "sess-tail"
 
-			writeSessionFile(t, homeDir, sid+".json", sessionFile{
+			writeSessionFile(t, homeDir, "999999999.json", sessionFile{
 				PID:       999999999,
 				SessionID: sid,
 				Cwd:       cwd,
@@ -739,8 +731,7 @@ func TestClaudeScanner_TailParsing(t *testing.T) {
 }
 
 // TestClaudeScanner_SlugTitle verifies that the scanner extracts the slug/title
-// from JSONL messages. The last slug value found in the tail should be used as
-// the session Title.
+// from JSONL messages.
 func TestClaudeScanner_SlugTitle(t *testing.T) {
 	startedAt := time.Now().UTC().Add(-1 * time.Hour).Truncate(time.Second)
 
@@ -777,7 +768,7 @@ func TestClaudeScanner_SlugTitle(t *testing.T) {
 			cwd := "/tmp/slug-test"
 			sid := "sess-slug"
 
-			writeSessionFile(t, homeDir, sid+".json", sessionFile{
+			writeSessionFile(t, homeDir, "999999999.json", sessionFile{
 				PID:       999999999,
 				SessionID: sid,
 				Cwd:       cwd,
@@ -795,41 +786,54 @@ func TestClaudeScanner_SlugTitle(t *testing.T) {
 	}
 }
 
-// TestClaudeScanner_EncodedCwdPath verifies that the scanner correctly encodes
-// the cwd path to find the projects directory. Claude Code replaces "/" with "-".
-func TestClaudeScanner_EncodedCwdPath(t *testing.T) {
-	startedAt := time.Now().UTC().Add(-1 * time.Hour).Truncate(time.Second)
-	const wantMsgCount = 2
+// TestClaudeScanner_CwdFromJSONL verifies that the scanner extracts cwd from
+// JSONL user messages when no session file is available.
+func TestClaudeScanner_CwdFromJSONL(t *testing.T) {
+	staleTimestamp := time.Now().UTC().Add(-5 * time.Minute).Truncate(time.Second)
+	cwd := "/home/user/project"
+	sid := "sess-cwd"
 
-	tests := map[string]string{
-		"simple_path":        "/home/user/project",
-		"path_with_spaces":   "/home/user/my project",
-		"root_path":          "/",
-		"deeply_nested_path": "/a/b/c/d/e/f/g",
+	homeDir := t.TempDir()
+	encoded := encodeCwd(cwd)
+	writeConversationJSONL(t, homeDir, encoded, sid, []jsonlMessage{
+		mkMsgWithCwd("user", staleTimestamp, nil, cwd),
+		mkMsg("assistant", staleTimestamp.Add(time.Second), nil),
+	})
+
+	s := scanSingle(t, homeDir)
+	if s.ProjectDir != cwd {
+		t.Errorf("ProjectDir = %q, want %q", s.ProjectDir, cwd)
 	}
+}
 
-	for name, cwd := range tests {
-		t.Run(name, func(t *testing.T) {
-			homeDir := t.TempDir()
-			sid := "sess-path-test"
+// TestClaudeScanner_SessionFileEnrichment verifies that PID and StartedAt
+// come from the session file when available.
+func TestClaudeScanner_SessionFileEnrichment(t *testing.T) {
+	startedAt := time.Now().UTC().Add(-1 * time.Hour).Truncate(time.Second)
+	staleTimestamp := time.Now().UTC().Add(-5 * time.Minute).Truncate(time.Second)
+	cwd := "/home/user/project"
+	sid := "sess-enriched"
 
-			writeSessionFile(t, homeDir, sid+".json", sessionFile{
-				PID:       999999999,
-				SessionID: sid,
-				Cwd:       cwd,
-				StartedAt: startedAt.UnixMilli(),
-			})
+	homeDir := t.TempDir()
+	writeSessionFile(t, homeDir, "42.json", sessionFile{
+		PID:       999999999,
+		SessionID: sid,
+		Cwd:       cwd,
+		StartedAt: startedAt.UnixMilli(),
+	})
+	encoded := encodeCwd(cwd)
+	writeConversationJSONL(t, homeDir, encoded, sid, []jsonlMessage{
+		mkMsg("user", staleTimestamp, nil),
+	})
 
-			encoded := encodeCwd(cwd)
-			writeConversationJSONL(t, homeDir, encoded, sid, []jsonlMessage{
-				mkMsg("user", startedAt.Add(1*time.Minute), nil),
-				mkMsg("assistant", startedAt.Add(2*time.Minute), nil),
-			})
-
-			s := scanSingle(t, homeDir)
-			if s.MessageCount != wantMsgCount {
-				t.Errorf("messageCount = %d, want %d (conversation may not have been found)", s.MessageCount, wantMsgCount)
-			}
-		})
+	s := scanSingle(t, homeDir)
+	if s.PID != 999999999 {
+		t.Errorf("PID = %d, want 999999999", s.PID)
+	}
+	if !s.StartedAt.Equal(startedAt) {
+		t.Errorf("StartedAt = %v, want %v (from session file)", s.StartedAt, startedAt)
+	}
+	if s.ProjectDir != cwd {
+		t.Errorf("ProjectDir = %q, want %q (from session file)", s.ProjectDir, cwd)
 	}
 }

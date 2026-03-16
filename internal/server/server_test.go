@@ -70,7 +70,7 @@ func TestServer_RegisterRoutes(t *testing.T) {
 		},
 		"sessions_api": {
 			method:     http.MethodGet,
-			path:       "/api/sessions",
+			path:       "/api/sessions?days=-1",
 			wantStatus: http.StatusOK,
 		},
 	}
@@ -307,7 +307,7 @@ func TestServer_HandleSessions(t *testing.T) {
 
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			rec := doRequest(t, http.MethodGet, "/api/sessions", tt.mockSetup)
+			rec := doRequest(t, http.MethodGet, "/api/sessions?days=-1", tt.mockSetup)
 
 			if rec.Code != tt.wants.statusCode {
 				t.Errorf("status code: got %d, want %d", rec.Code, tt.wants.statusCode)
@@ -342,7 +342,7 @@ func TestServer_HandleSessions(t *testing.T) {
 func TestServer_HandleSessions_ResponseFormat(t *testing.T) {
 	now := time.Date(2025, 6, 15, 10, 0, 0, 0, time.UTC)
 
-	rec := doRequest(t, http.MethodGet, "/api/sessions", func(s *mocks.MockSessionScanner) {
+	rec := doRequest(t, http.MethodGet, "/api/sessions?days=-1", func(s *mocks.MockSessionScanner) {
 		s.EXPECT().Scan(gomock.Any()).Return([]model.SessionInfo{
 			{
 				ID:            "sess-1",
@@ -394,7 +394,7 @@ func TestServer_HandleSessions_ResponseFormat(t *testing.T) {
 
 func TestServer_HandleSessions_EmptyArrayNotNull(t *testing.T) {
 	// When scanner returns nil, the JSON response should be [] not null.
-	rec := doRequest(t, http.MethodGet, "/api/sessions", func(s *mocks.MockSessionScanner) {
+	rec := doRequest(t, http.MethodGet, "/api/sessions?days=-1", func(s *mocks.MockSessionScanner) {
 		s.EXPECT().Scan(gomock.Any()).Return(nil, nil)
 	})
 
@@ -405,5 +405,78 @@ func TestServer_HandleSessions_EmptyArrayNotNull(t *testing.T) {
 	body := strings.TrimSpace(rec.Body.String())
 	if body != "[]" {
 		t.Errorf("expected empty JSON array '[]', got %q", body)
+	}
+}
+
+func TestServer_HandleSessions_DaysFilter(t *testing.T) {
+	// Fix "now" so tests are deterministic.
+	fakeNow := time.Date(2026, 3, 17, 14, 0, 0, 0, time.Local)
+	origNow := nowFunc
+	nowFunc = func() time.Time { return fakeNow }
+	t.Cleanup(func() { nowFunc = origNow })
+
+	today := time.Date(2026, 3, 17, 9, 0, 0, 0, time.Local)
+	yesterday := time.Date(2026, 3, 16, 15, 0, 0, 0, time.Local)
+	threeDaysAgo := time.Date(2026, 3, 14, 12, 0, 0, 0, time.Local)
+
+	allSessions := []model.SessionInfo{
+		{ID: "today", Provider: model.ProviderClaude, Status: model.StatusActive, LastActive: today},
+		{ID: "yesterday", Provider: model.ProviderClaude, Status: model.StatusIdle, LastActive: yesterday},
+		{ID: "old", Provider: model.ProviderClaude, Status: model.StatusFinished, LastActive: threeDaysAgo},
+		{ID: "brand-new", Provider: model.ProviderClaude, Status: model.StatusActive}, // zero LastActive
+	}
+
+	mockSetup := func(s *mocks.MockSessionScanner) {
+		s.EXPECT().Scan(gomock.Any()).Return(allSessions, nil)
+	}
+
+	tests := map[string]struct {
+		path    string
+		wantIDs []string
+	}{
+		"default_no_param_today_only": {
+			path:    "/api/sessions",
+			wantIDs: []string{"today", "brand-new"},
+		},
+		"days_0_same_as_default": {
+			path:    "/api/sessions?days=0",
+			wantIDs: []string{"today", "brand-new"},
+		},
+		"days_1_today_and_yesterday": {
+			path:    "/api/sessions?days=1",
+			wantIDs: []string{"today", "yesterday", "brand-new"},
+		},
+		"days_7_last_week": {
+			path:    "/api/sessions?days=7",
+			wantIDs: []string{"today", "yesterday", "old", "brand-new"},
+		},
+		"days_negative_1_all_sessions": {
+			path:    "/api/sessions?days=-1",
+			wantIDs: []string{"today", "yesterday", "old", "brand-new"},
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			rec := doRequest(t, http.MethodGet, tt.path, mockSetup)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status code: got %d, want %d", rec.Code, http.StatusOK)
+			}
+
+			var got []model.SessionInfo
+			if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+				t.Fatalf("failed to decode response: %v", err)
+			}
+
+			gotIDs := make([]string, len(got))
+			for i, s := range got {
+				gotIDs[i] = s.ID
+			}
+
+			if !reflect.DeepEqual(gotIDs, tt.wantIDs) {
+				t.Errorf("session IDs mismatch:\ngot:  %v\nwant: %v", gotIDs, tt.wantIDs)
+			}
+		})
 	}
 }

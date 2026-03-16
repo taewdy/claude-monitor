@@ -66,7 +66,7 @@ func session(id string, status model.Status) model.SessionInfo {
 	}
 }
 
-func TestNewSessionsNotify(t *testing.T) {
+func TestNewSessionsDoNotNotify(t *testing.T) {
 	sc := &mockScanner{results: []model.SessionInfo{
 		session("s1", model.StatusActive),
 		session("s2", model.StatusIdle),
@@ -77,24 +77,19 @@ func TestNewSessionsNotify(t *testing.T) {
 	m.poll(context.Background())
 
 	changes := n.getChanges()
-	if len(changes) != 2 {
-		t.Fatalf("expected 2 notifications, got %d", len(changes))
-	}
-	for _, c := range changes {
-		if c.OldStatus != "" {
-			t.Errorf("new session should have empty OldStatus, got %q", c.OldStatus)
-		}
+	if len(changes) != 0 {
+		t.Fatalf("expected 0 notifications for new sessions, got %d", len(changes))
 	}
 }
 
-func TestStatusChangeNotifies(t *testing.T) {
+func TestStatusChangeActiveToIdleNotifies(t *testing.T) {
 	sc := &mockScanner{results: []model.SessionInfo{
 		session("s1", model.StatusActive),
 	}}
 	n := &mockNotifier{}
 	m := New(sc, n, time.Hour)
 
-	// Initial poll — new session.
+	// Initial poll — new session (no notification).
 	m.poll(context.Background())
 
 	// First poll with new status — pending, no notification yet.
@@ -102,18 +97,18 @@ func TestStatusChangeNotifies(t *testing.T) {
 	m.poll(context.Background())
 
 	changes := n.getChanges()
-	if len(changes) != 1 {
-		t.Fatalf("expected 1 notification (initial only, change pending), got %d", len(changes))
+	if len(changes) != 0 {
+		t.Fatalf("expected 0 notifications (change pending), got %d", len(changes))
 	}
 
 	// Second poll with same new status — confirmed, should notify.
 	m.poll(context.Background())
 
 	changes = n.getChanges()
-	if len(changes) != 2 {
-		t.Fatalf("expected 2 notifications (initial + confirmed change), got %d", len(changes))
+	if len(changes) != 1 {
+		t.Fatalf("expected 1 notification (confirmed active->idle), got %d", len(changes))
 	}
-	c := changes[1]
+	c := changes[0]
 	if c.OldStatus != model.StatusActive {
 		t.Errorf("expected OldStatus=active, got %q", c.OldStatus)
 	}
@@ -133,12 +128,12 @@ func TestUnchangedSessionsNoNotification(t *testing.T) {
 	m.poll(context.Background()) // same data
 
 	changes := n.getChanges()
-	if len(changes) != 1 {
-		t.Fatalf("expected 1 notification (initial only), got %d", len(changes))
+	if len(changes) != 0 {
+		t.Fatalf("expected 0 notifications, got %d", len(changes))
 	}
 }
 
-func TestDisappearedSessionNotifiesFinished(t *testing.T) {
+func TestDisappearedActiveSessionNotifiesFinished(t *testing.T) {
 	sc := &mockScanner{results: []model.SessionInfo{
 		session("s1", model.StatusActive),
 	}}
@@ -152,10 +147,10 @@ func TestDisappearedSessionNotifiesFinished(t *testing.T) {
 	m.poll(context.Background())
 
 	changes := n.getChanges()
-	if len(changes) != 2 {
-		t.Fatalf("expected 2 notifications, got %d", len(changes))
+	if len(changes) != 1 {
+		t.Fatalf("expected 1 notification, got %d", len(changes))
 	}
-	c := changes[1]
+	c := changes[0]
 	if c.Session.ID != "s1" {
 		t.Errorf("expected disappeared session ID=s1, got %q", c.Session.ID)
 	}
@@ -164,6 +159,25 @@ func TestDisappearedSessionNotifiesFinished(t *testing.T) {
 	}
 	if c.NewStatus != model.StatusFinished {
 		t.Errorf("expected NewStatus=finished, got %q", c.NewStatus)
+	}
+}
+
+func TestDisappearedIdleSessionDoesNotNotify(t *testing.T) {
+	sc := &mockScanner{results: []model.SessionInfo{
+		session("s1", model.StatusIdle),
+	}}
+	n := &mockNotifier{}
+	m := New(sc, n, time.Hour)
+
+	m.poll(context.Background())
+
+	// Session disappears.
+	sc.set([]model.SessionInfo{}, nil)
+	m.poll(context.Background())
+
+	changes := n.getChanges()
+	if len(changes) != 0 {
+		t.Fatalf("expected 0 notifications for disappeared idle session, got %d", len(changes))
 	}
 }
 
@@ -219,8 +233,8 @@ func TestScanErrorPreservesCache(t *testing.T) {
 
 	// Prev state should also be preserved — no extra notifications.
 	changes := n.getChanges()
-	if len(changes) != 1 {
-		t.Errorf("expected 1 notification (initial only), got %d", len(changes))
+	if len(changes) != 0 {
+		t.Errorf("expected 0 notifications, got %d", len(changes))
 	}
 }
 
@@ -242,8 +256,8 @@ func TestScanErrorPreservesPrevState(t *testing.T) {
 	m.poll(context.Background())
 
 	changes := n.getChanges()
-	if len(changes) != 1 {
-		t.Errorf("expected 1 notification total (prev state preserved), got %d", len(changes))
+	if len(changes) != 0 {
+		t.Errorf("expected 0 notifications (prev state preserved), got %d", len(changes))
 	}
 }
 
@@ -353,10 +367,51 @@ func TestDebounceCancelledWhenStatusReverts(t *testing.T) {
 	sc.set([]model.SessionInfo{session("s1", model.StatusActive)}, nil)
 	m.poll(context.Background())
 
-	// No status change notification should have fired (only the initial new session).
+	// No notification should have fired (new sessions don't notify, and the
+	// status change reverted before confirmation).
 	changes := n.getChanges()
-	if len(changes) != 1 {
-		t.Fatalf("expected 1 notification (initial only), got %d", len(changes))
+	if len(changes) != 0 {
+		t.Fatalf("expected 0 notifications, got %d", len(changes))
+	}
+}
+
+func TestIdleToActiveDoesNotNotify(t *testing.T) {
+	sc := &mockScanner{results: []model.SessionInfo{
+		session("s1", model.StatusIdle),
+	}}
+	n := &mockNotifier{}
+	m := New(sc, n, time.Hour)
+
+	m.poll(context.Background())
+
+	// Transition idle → active.
+	sc.set([]model.SessionInfo{session("s1", model.StatusActive)}, nil)
+	m.poll(context.Background()) // pending
+	m.poll(context.Background()) // confirmed
+
+	changes := n.getChanges()
+	if len(changes) != 0 {
+		t.Fatalf("expected 0 notifications for idle->active, got %d", len(changes))
+	}
+}
+
+func TestWaitingToIdleDoesNotNotify(t *testing.T) {
+	sc := &mockScanner{results: []model.SessionInfo{
+		session("s1", model.StatusWaiting),
+	}}
+	n := &mockNotifier{}
+	m := New(sc, n, time.Hour)
+
+	m.poll(context.Background())
+
+	// Transition waiting → idle.
+	sc.set([]model.SessionInfo{session("s1", model.StatusIdle)}, nil)
+	m.poll(context.Background()) // pending
+	m.poll(context.Background()) // confirmed
+
+	changes := n.getChanges()
+	if len(changes) != 0 {
+		t.Fatalf("expected 0 notifications for waiting->idle, got %d", len(changes))
 	}
 }
 
