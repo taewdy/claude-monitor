@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os/exec"
 
 	"github.com/universe/claude-monitor/internal/model"
 )
@@ -159,6 +160,32 @@ func (m *MultiNotifier) Notify(ctx context.Context, change StatusChange) error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// DesktopNotifier sends macOS desktop notifications via osascript.
+type DesktopNotifier struct {
+	soundName string
+}
+
+// NewDesktopNotifier creates a DesktopNotifier that displays native macOS notifications.
+// soundName controls the alert sound (e.g. "default", "Ping", "Basso").
+func NewDesktopNotifier(soundName string) *DesktopNotifier {
+	return &DesktopNotifier{soundName: soundName}
+}
+
+// buildScript returns the AppleScript expression for a desktop notification.
+func (d *DesktopNotifier) buildScript(message string) string {
+	return fmt.Sprintf(`display notification %q with title "Claude Monitor" sound name %q`, message, d.soundName)
+}
+
+// Notify displays a macOS desktop notification for the status change.
+func (d *DesktopNotifier) Notify(ctx context.Context, change StatusChange) error {
+	script := d.buildScript(formatMessage(change))
+	cmd := exec.CommandContext(ctx, "osascript", "-e", script)
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("executing osascript: %w", err)
+	}
+	return nil
 }
 
 // NoopNotifier discards all notifications.

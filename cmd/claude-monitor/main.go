@@ -19,6 +19,8 @@ func main() {
 	addr := flag.String("addr", ":8555", "HTTP listen address")
 	slackWebhook := flag.String("slack-webhook", "", "Slack incoming webhook URL")
 	teamsWebhook := flag.String("teams-webhook", "", "Microsoft Teams incoming webhook URL")
+	desktopNotify := flag.Bool("desktop-notify", false, "enable macOS desktop notifications")
+	notifySound := flag.String("notify-sound", "default", "sound name for desktop notifications")
 	poll := flag.Duration("poll", 5*time.Second, "polling interval")
 	flag.Parse()
 
@@ -38,6 +40,9 @@ func main() {
 	}
 	if teamsURL != "" {
 		notifiers = append(notifiers, notify.NewTeamsNotifier(teamsURL))
+	}
+	if *desktopNotify {
+		notifiers = append(notifiers, notify.NewDesktopNotifier(*notifySound))
 	}
 
 	var notifier notify.Notifier

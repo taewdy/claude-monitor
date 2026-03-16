@@ -297,6 +297,68 @@ func TestMultiNotifier_AttemptsAllNotifiers(t *testing.T) {
 	}
 }
 
+func TestDesktopNotifier_BuildScript(t *testing.T) {
+	d := NewDesktopNotifier("default")
+	change := StatusChange{
+		Session: model.SessionInfo{
+			ID:         "abc-123",
+			Provider:   model.ProviderClaude,
+			Title:      "refactor auth",
+			ProjectDir: "/home/user/project",
+		},
+		OldStatus: model.StatusActive,
+		NewStatus: model.StatusIdle,
+	}
+
+	script := d.buildScript(formatMessage(change))
+
+	// Verify the script contains the expected osascript structure.
+	if !strings.Contains(script, "display notification") {
+		t.Errorf("script %q missing 'display notification'", script)
+	}
+	if !strings.Contains(script, `with title "Claude Monitor"`) {
+		t.Errorf("script %q missing title", script)
+	}
+	if !strings.Contains(script, `sound name "default"`) {
+		t.Errorf("script %q missing sound name", script)
+	}
+
+	// Verify the message content includes expected fields.
+	for _, want := range []string{"claude", "refactor auth", "/home/user/project", "active", "idle"} {
+		if !strings.Contains(script, want) {
+			t.Errorf("script %q missing expected substring %q", script, want)
+		}
+	}
+}
+
+func TestDesktopNotifier_BuildScript_CustomSound(t *testing.T) {
+	d := NewDesktopNotifier("Ping")
+	script := d.buildScript("test message")
+
+	if !strings.Contains(script, `sound name "Ping"`) {
+		t.Errorf("script %q missing custom sound name 'Ping'", script)
+	}
+}
+
+func TestDesktopNotifier_BuildScript_FallsBackToID(t *testing.T) {
+	d := NewDesktopNotifier("default")
+	change := StatusChange{
+		Session: model.SessionInfo{
+			ID:         "sess-789",
+			Provider:   model.ProviderCodex,
+			ProjectDir: "/tmp/proj",
+		},
+		OldStatus: model.StatusWaiting,
+		NewStatus: model.StatusFinished,
+	}
+
+	script := d.buildScript(formatMessage(change))
+
+	if !strings.Contains(script, "sess-789") {
+		t.Errorf("script %q should contain session ID when title is empty", script)
+	}
+}
+
 func TestNoopNotifier_Notify(t *testing.T) {
 	n := &NoopNotifier{}
 	err := n.Notify(context.Background(), StatusChange{})
