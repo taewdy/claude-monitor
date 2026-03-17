@@ -153,18 +153,19 @@ func (c *copilotScanner) determineStatus(sid string, hasShutdown bool, lastEvent
 		return model.StatusWaiting
 	}
 
-	// Check lock files (both IDE lock and in-session lock)
-	if c.isIDELockAlive(sid) || c.isSessionLockAlive(sid) {
+	// Time-based determination using last event, mirroring Claude's mtime approach.
+	elapsed := time.Since(lastEventTime)
+
+	if elapsed < 2*time.Minute {
 		return model.StatusActive
 	}
 
-	// Time-based determination
-	elapsed := time.Since(lastEventTime)
-	if elapsed >= 60*time.Second {
+	// Stale events: if process is still alive treat as idle, otherwise finished.
+	if c.isIDELockAlive(sid) || c.isSessionLockAlive(sid) {
 		return model.StatusIdle
 	}
 
-	return model.StatusActive
+	return model.StatusFinished
 }
 
 // isIDELockAlive checks if an IDE lock file exists and its PID is alive.

@@ -203,8 +203,8 @@ func TestCopilotScanner_Scan(t *testing.T) {
 				},
 			},
 		},
-		"single_idle_session": {
-			// No shutdown event + last event > 60s ago → idle.
+		"single_finished_stale_session": {
+			// No shutdown event + last event > 2min ago + no lock → finished.
 			buildFS: func(t *testing.T, homeDir string) {
 				sid := "660e8400-e29b-41d4-a716-446655440001"
 				writeWorkspaceYAML(t, homeDir, sid, workspaceYAML{
@@ -223,7 +223,7 @@ func TestCopilotScanner_Scan(t *testing.T) {
 				{
 					ID:         "660e8400-e29b-41d4-a716-446655440001",
 					Provider:   model.ProviderCopilot,
-					Status:     model.StatusIdle,
+					Status:     model.StatusFinished,
 					Title:      "DB refactor",
 					ProjectDir: "/home/user/backend",
 					GitBranch:  "main",
@@ -287,8 +287,8 @@ func TestCopilotScanner_Scan(t *testing.T) {
 				},
 			},
 		},
-		"active_session_with_ide_lock": {
-			// IDE lock file exists with live PID → active regardless of event age.
+		"idle_session_with_ide_lock_stale_event": {
+			// IDE lock file exists with live PID but event > 2min ago → idle.
 			buildFS: func(t *testing.T, homeDir string) {
 				sid := "990e8400-e29b-41d4-a716-446655440004"
 				writeWorkspaceYAML(t, homeDir, sid, workspaceYAML{
@@ -311,7 +311,7 @@ func TestCopilotScanner_Scan(t *testing.T) {
 				{
 					ID:         "990e8400-e29b-41d4-a716-446655440004",
 					Provider:   model.ProviderCopilot,
-					Status:     model.StatusActive,
+					Status:     model.StatusIdle,
 					Title:      "IDE session",
 					ProjectDir: "/home/user/ide-proj",
 					GitBranch:  "dev",
@@ -606,14 +606,14 @@ func TestCopilotScanner_StatusDetermination(t *testing.T) {
 			},
 			status: model.StatusActive,
 		},
-		"no_shutdown_stale_event_is_idle": {
-			// Last event > 60s ago, no shutdown → idle.
+		"no_shutdown_stale_event_no_lock_is_finished": {
+			// Last event > 2min ago, no shutdown, no lock → finished.
 			buildFS: func(t *testing.T, homeDir, sid string) {
 				writeEventsJSONL(t, homeDir, sid, []copilotEvent{
 					{Type: "assistant.message", Timestamp: now.Add(-5 * time.Minute).Unix()},
 				})
 			},
-			status: model.StatusIdle,
+			status: model.StatusFinished,
 		},
 		"last_event_assistant_turn_end_is_waiting": {
 			// Last event is assistant.turn_end → waiting.
@@ -635,8 +635,8 @@ func TestCopilotScanner_StatusDetermination(t *testing.T) {
 			},
 			status: model.StatusFinished,
 		},
-		"ide_lock_alive_pid_overrides_idle": {
-			// Event is stale (would be idle) but IDE lock with alive PID → active.
+		"ide_lock_alive_pid_stale_event_is_idle": {
+			// Event is stale (> 2 min) + IDE lock with alive PID → idle.
 			buildFS: func(t *testing.T, homeDir, sid string) {
 				writeEventsJSONL(t, homeDir, sid, []copilotEvent{
 					{Type: "assistant.message", Timestamp: now.Add(-5 * time.Minute).Unix()},
@@ -646,10 +646,10 @@ func TestCopilotScanner_StatusDetermination(t *testing.T) {
 					IDEName: "vscode",
 				})
 			},
-			status: model.StatusActive,
+			status: model.StatusIdle,
 		},
-		"ide_lock_dead_pid_no_override": {
-			// IDE lock exists but PID is dead → does not override idle/finished.
+		"ide_lock_dead_pid_stale_event_is_finished": {
+			// IDE lock exists but PID is dead + stale event → finished.
 			buildFS: func(t *testing.T, homeDir, sid string) {
 				writeEventsJSONL(t, homeDir, sid, []copilotEvent{
 					{Type: "assistant.message", Timestamp: now.Add(-5 * time.Minute).Unix()},
@@ -659,27 +659,27 @@ func TestCopilotScanner_StatusDetermination(t *testing.T) {
 					IDEName: "vscode",
 				})
 			},
-			status: model.StatusIdle,
+			status: model.StatusFinished,
 		},
-		"session_lock_alive_pid_overrides_idle": {
-			// Stale event (would be idle) but inuse.*.lock with alive PID → active.
+		"session_lock_alive_pid_stale_event_is_idle": {
+			// Stale event (> 2 min) + inuse.*.lock with alive PID → idle.
 			buildFS: func(t *testing.T, homeDir, sid string) {
 				writeEventsJSONL(t, homeDir, sid, []copilotEvent{
 					{Type: "assistant.message", Timestamp: now.Add(-5 * time.Minute).Unix()},
 				})
 				writeSessionLockFile(t, homeDir, sid, os.Getpid())
 			},
-			status: model.StatusActive,
+			status: model.StatusIdle,
 		},
-		"session_lock_dead_pid_no_override": {
-			// inuse.*.lock with dead PID → does not override idle.
+		"session_lock_dead_pid_stale_event_is_finished": {
+			// inuse.*.lock with dead PID + stale event → finished.
 			buildFS: func(t *testing.T, homeDir, sid string) {
 				writeEventsJSONL(t, homeDir, sid, []copilotEvent{
 					{Type: "assistant.message", Timestamp: now.Add(-5 * time.Minute).Unix()},
 				})
 				writeSessionLockFile(t, homeDir, sid, 999999999)
 			},
-			status: model.StatusIdle,
+			status: model.StatusFinished,
 		},
 		"no_events_session_lock_alive_is_active": {
 			// No events at all, but inuse.*.lock with alive PID and recent workspace → active.
@@ -743,18 +743,19 @@ func TestCopilotScanner_StatusBoundaries(t *testing.T) {
 			lastEventAge: 0,
 			want:         model.StatusActive,
 		},
-		"59_seconds_ago_is_active": {
-			lastEventAge: 59 * time.Second,
+		"119_seconds_ago_is_active": {
+			lastEventAge: 119 * time.Second,
 			want:         model.StatusActive,
 		},
-		"60_seconds_ago_is_idle": {
-			// Boundary: exactly 60s should transition to idle.
-			lastEventAge: 60 * time.Second,
-			want:         model.StatusIdle,
+		"2_minutes_ago_is_finished": {
+			// Boundary: exactly 2min should transition out of active.
+			// No alive lock → finished.
+			lastEventAge: 2 * time.Minute,
+			want:         model.StatusFinished,
 		},
-		"5_minutes_ago_is_idle": {
+		"5_minutes_ago_is_finished": {
 			lastEventAge: 5 * time.Minute,
-			want:         model.StatusIdle,
+			want:         model.StatusFinished,
 		},
 	}
 
