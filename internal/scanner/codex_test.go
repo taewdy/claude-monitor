@@ -343,6 +343,78 @@ func TestCodexScanner_ScanFromDB(t *testing.T) {
 	}
 }
 
+func TestCodexScanner_ScanFromDB_MessageCount(t *testing.T) {
+	now := time.Now()
+
+	t.Run("recent_thread_with_rollout_messages", func(t *testing.T) {
+		homeDir := t.TempDir()
+
+		// Create a rollout file with message events.
+		path := writeRolloutFile(t, homeDir, "thread-msg", "/proj", "main",
+			now.Add(-1*time.Hour), now.Add(-10*time.Second))
+		f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fmt.Fprintln(f, `{"type":"event_msg","payload":{"type":"user_message"}}`)
+		fmt.Fprintln(f, `{"type":"event_msg","payload":{"type":"agent_message"}}`)
+		f.Close()
+
+		// Create DB with a thread pointing to that rollout path.
+		createCodexDB(t, homeDir, []threadRow{
+			{
+				ID:          "thread-msg",
+				Title:       "Test Messages",
+				Cwd:         "/proj",
+				TokensUsed:  1000,
+				UpdatedAt:   now.Add(-10 * time.Second).Unix(),
+				GitBranch:   "main",
+				RolloutPath: path,
+			},
+		})
+
+		cs := newCodexScanner(homeDir)
+		got, err := cs.scan(context.Background())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(got) != 1 {
+			t.Fatalf("expected 1 session, got %d", len(got))
+		}
+		if got[0].MessageCount != 2 {
+			t.Errorf("MessageCount = %d, want 2", got[0].MessageCount)
+		}
+	})
+
+	t.Run("old_thread_no_rollout_parsing", func(t *testing.T) {
+		homeDir := t.TempDir()
+
+		// Create DB with a thread older than 24h — rollout should NOT be parsed.
+		createCodexDB(t, homeDir, []threadRow{
+			{
+				ID:          "thread-old",
+				Title:       "Old Thread",
+				Cwd:         "/proj",
+				TokensUsed:  500,
+				UpdatedAt:   now.Add(-48 * time.Hour).Unix(),
+				RolloutPath: "/nonexistent/rollout.jsonl",
+			},
+		})
+
+		cs := newCodexScanner(homeDir)
+		got, err := cs.scan(context.Background())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(got) != 1 {
+			t.Fatalf("expected 1 session, got %d", len(got))
+		}
+		if got[0].MessageCount != 0 {
+			t.Errorf("MessageCount = %d, want 0 (old thread should skip rollout)", got[0].MessageCount)
+		}
+	})
+}
+
 // ---------- Rollout file fallback tests ----------
 
 func TestCodexScanner_ScanFromRolloutFiles(t *testing.T) {
@@ -503,6 +575,34 @@ func TestCodexScanner_ScanFromRolloutFiles(t *testing.T) {
 		_, err := cs.scan(ctx)
 		if err == nil {
 			t.Fatal("expected error from cancelled context")
+		}
+	})
+
+	t.Run("message_count_propagated", func(t *testing.T) {
+		homeDir := t.TempDir()
+		path := writeRolloutFile(t, homeDir, "sess-msgs", "/proj", "main",
+			now.Add(-1*time.Hour), now.Add(-30*time.Second))
+
+		// Append message events to the rollout file.
+		f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fmt.Fprintln(f, `{"type":"event_msg","payload":{"type":"user_message"}}`)
+		fmt.Fprintln(f, `{"type":"event_msg","payload":{"type":"agent_message"}}`)
+		fmt.Fprintln(f, `{"type":"event_msg","payload":{"type":"agent_message"}}`)
+		f.Close()
+
+		cs := newCodexScanner(homeDir)
+		got, err := cs.scan(context.Background())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(got) != 1 {
+			t.Fatalf("expected 1 session, got %d", len(got))
+		}
+		if got[0].MessageCount != 3 {
+			t.Errorf("MessageCount = %d, want 3", got[0].MessageCount)
 		}
 	})
 }
@@ -850,6 +950,48 @@ func TestCodexScanner_ParseRolloutMeta(t *testing.T) {
 		_, err := cs.parseRolloutMeta(path)
 		if err == nil {
 			t.Fatal("expected error for non-session_meta first line")
+		}
+	})
+
+	t.Run("counts_user_and_agent_messages", func(t *testing.T) {
+		homeDir := t.TempDir()
+		path := writeRolloutFile(t, homeDir, "msg-count-id", "/proj", "main",
+			now.Add(-1*time.Hour), now)
+
+		// Append user and agent message events to the rollout file.
+		f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+		if err != nil {
+			t.Fatal(err)
+		}
+		events := []string{
+			`{"type":"event_msg","payload":{"type":"user_message"}}`,
+			`{"type":"event_msg","payload":{"type":"agent_message"}}`,
+			`{"type":"event_msg","payload":{"type":"agent_message"}}`,
+			`{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":50}}}}`,
+			`{"type":"event_msg","payload":{"type":"user_message"}}`,
+			`{"type":"event_msg","payload":{"type":"agent_message"}}`,
+		}
+		for _, e := range events {
+			if _, err := fmt.Fprintln(f, e); err != nil {
+				t.Fatal(err)
+			}
+		}
+		f.Close()
+
+		cs := newCodexScanner(homeDir)
+		meta, err := cs.parseRolloutMeta(path)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if meta.MessageCount != 5 {
+			t.Errorf("MessageCount = %d, want 5", meta.MessageCount)
+		}
+		// Token counts should still be parsed.
+		if meta.InputTokens != 100 {
+			t.Errorf("InputTokens = %d, want 100", meta.InputTokens)
+		}
+		if meta.OutputTokens != 50 {
+			t.Errorf("OutputTokens = %d, want 50", meta.OutputTokens)
 		}
 	})
 }

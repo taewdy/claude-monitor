@@ -76,10 +76,14 @@ func (c *codexScanner) scanFromDB(ctx context.Context) ([]model.SessionInfo, err
 	for _, r := range rows {
 		updatedAt := time.Unix(r.UpdatedAt, 0)
 
-		// For recent threads, check rollout for a newer timestamp.
+		// For recent threads, parse rollout for a newer timestamp and message count.
+		var messageCount int
 		if r.RolloutPath != "" && time.Since(updatedAt) < 24*time.Hour {
 			if ts := c.rolloutFileMtime(r.RolloutPath); ts.After(updatedAt) {
 				updatedAt = ts
+			}
+			if meta, err := c.parseRolloutMeta(r.RolloutPath); err == nil {
+				messageCount = meta.MessageCount
 			}
 		}
 
@@ -105,10 +109,11 @@ func (c *codexScanner) scanFromDB(ctx context.Context) ([]model.SessionInfo, err
 			Title:    title,
 			// InputTokens holds the combined total (input+output) since the
 			// Codex DB stores a single tokens_used value without splitting.
-			InputTokens: r.TokensUsed,
-			ProjectDir:  r.Cwd,
-			GitBranch:   r.GitBranch,
-			LastActive:  updatedAt,
+			InputTokens:  r.TokensUsed,
+			MessageCount: messageCount,
+			ProjectDir:   r.Cwd,
+			GitBranch:    r.GitBranch,
+			LastActive:   updatedAt,
 		})
 	}
 
@@ -204,6 +209,7 @@ func (c *codexScanner) scanFromRolloutFiles(ctx context.Context) ([]model.Sessio
 			Title:        title,
 			InputTokens:  meta.InputTokens,
 			OutputTokens: meta.OutputTokens,
+			MessageCount: meta.MessageCount,
 			ProjectDir:   meta.Cwd,
 			GitBranch:    meta.GitBranch,
 			StartedAt:    meta.StartedAt,
@@ -235,6 +241,7 @@ type rolloutMeta struct {
 	StartedAt    time.Time
 	InputTokens  int64
 	OutputTokens int64
+	MessageCount int
 }
 
 // parseRolloutMeta reads a rollout JSONL file to extract session metadata
@@ -303,9 +310,14 @@ func (c *codexScanner) parseRolloutMeta(path string) (*rolloutMeta, error) {
 		if err := json.Unmarshal(line, &evt); err != nil {
 			continue
 		}
-		if evt.Type == "event_msg" && evt.Payload.Type == "token_count" {
-			meta.InputTokens = evt.Payload.Info.TotalTokenUsage.InputTokens
-			meta.OutputTokens = evt.Payload.Info.TotalTokenUsage.OutputTokens
+		if evt.Type == "event_msg" {
+			switch evt.Payload.Type {
+			case "token_count":
+				meta.InputTokens = evt.Payload.Info.TotalTokenUsage.InputTokens
+				meta.OutputTokens = evt.Payload.Info.TotalTokenUsage.OutputTokens
+			case "user_message", "agent_message":
+				meta.MessageCount++
+			}
 		}
 	}
 
