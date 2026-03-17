@@ -140,6 +140,12 @@ func (c *claudeScanner) scan(ctx context.Context) ([]model.SessionInfo, error) {
 				jsonlMtime = fi.ModTime()
 			}
 
+			// Use file mtime for LastActive when parsed timestamps are stale
+			// or absent (many JSONL line types lack top-level timestamp fields).
+			if !jsonlMtime.IsZero() && jsonlMtime.After(info.LastActive) {
+				info.LastActive = jsonlMtime
+			}
+
 			info.Status = c.determineStatus(info.PID, jsonlMtime, lastRole)
 
 			sessions = append(sessions, info)

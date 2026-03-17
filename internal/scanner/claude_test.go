@@ -241,6 +241,7 @@ func TestClaudeScanner_Scan(t *testing.T) {
 					mkMsg("assistant", startedAt.Add(2*time.Minute), &usage{InputTokens: 0, OutputTokens: 250}),
 					mkMsg("user", staleTimestamp, &usage{InputTokens: 150, OutputTokens: 0}),
 				})
+				setFileMtime(t, homeDir, sid, cwd, staleTimestamp)
 			},
 			wants: wants{
 				sessions: []model.SessionInfo{
@@ -304,6 +305,7 @@ func TestClaudeScanner_Scan(t *testing.T) {
 					mkMsg("user", ts, nil),
 				})
 				writeSubagentFiles(t, homeDir, encoded, sid, 3)
+				setFileMtime(t, homeDir, sid, cwd, ts)
 			},
 			wants: wants{
 				sessions: []model.SessionInfo{
@@ -369,6 +371,7 @@ func TestClaudeScanner_Scan(t *testing.T) {
 					mkMsg("user", recentTimestamp.Add(-1*time.Second), &usage{InputTokens: 200, OutputTokens: 0}),
 					mkMsg("assistant", recentTimestamp, &usage{InputTokens: 0, OutputTokens: 800}),
 				})
+				setFileMtime(t, homeDir, sid, cwd, recentTimestamp)
 			},
 			wants: wants{
 				sessions: []model.SessionInfo{
@@ -417,6 +420,8 @@ func TestClaudeScanner_Scan(t *testing.T) {
 				validData2, _ := json.Marshal(validMsg2)
 				f.Write(validData2)
 				f.WriteString("\n")
+				f.Close()
+				setFileMtime(t, homeDir, sid, cwd, staleTimestamp.Add(time.Second))
 			},
 			wants: wants{
 				sessions: []model.SessionInfo{
@@ -454,6 +459,7 @@ func TestClaudeScanner_Scan(t *testing.T) {
 				if err := os.WriteFile(filepath.Join(dir, sid+".jsonl"), []byte(""), 0o644); err != nil {
 					t.Fatal(err)
 				}
+				setFileMtime(t, homeDir, sid, cwd, staleTimestamp)
 			},
 			wants: wants{
 				sessions: []model.SessionInfo{
@@ -463,6 +469,7 @@ func TestClaudeScanner_Scan(t *testing.T) {
 						Status:     model.StatusFinished,
 						ProjectDir: "/home/user/empty-conv",
 						StartedAt:  startedAt,
+						LastActive: staleTimestamp,
 						PID:        999999999,
 					},
 				},
@@ -838,5 +845,30 @@ func TestClaudeScanner_SessionFileEnrichment(t *testing.T) {
 	}
 	if s.ProjectDir != cwd {
 		t.Errorf("ProjectDir = %q, want %q (from session file)", s.ProjectDir, cwd)
+	}
+}
+
+// TestClaudeScanner_MtimeFallbackForLastActive verifies that file mtime is used
+// for LastActive when it is more recent than parsed timestamps, covering cases
+// where recent JSONL lines lack top-level timestamp fields.
+func TestClaudeScanner_MtimeFallbackForLastActive(t *testing.T) {
+	staleTimestamp := time.Now().UTC().Add(-10 * time.Minute).Truncate(time.Second)
+	recentMtime := time.Now().UTC().Add(-30 * time.Second).Truncate(time.Second)
+	cwd := "/home/user/mtime-test"
+	sid := "sess-mtime"
+
+	homeDir := t.TempDir()
+	encoded := encodeCwd(cwd)
+	// Write JSONL with a stale parsed timestamp.
+	writeConversationJSONL(t, homeDir, encoded, sid, []jsonlMessage{
+		mkMsgWithCwd("user", staleTimestamp, nil, cwd),
+	})
+	// Set file mtime to something more recent than the parsed timestamp,
+	// simulating recent writes that lack timestamp fields.
+	setFileMtime(t, homeDir, sid, cwd, recentMtime)
+
+	s := scanSingle(t, homeDir)
+	if !s.LastActive.Equal(recentMtime) {
+		t.Errorf("LastActive = %v, want %v (file mtime)", s.LastActive, recentMtime)
 	}
 }
