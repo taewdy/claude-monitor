@@ -365,8 +365,12 @@
             if (s.gitBranch) {
                 metaRows += '<div class="meta-item"><span class="meta-label">Branch:</span> <span class="meta-value">' + esc(s.gitBranch) + '</span></div>';
             }
-            metaRows += '<div class="meta-item"><span class="meta-label">Tokens:</span> <span class="meta-value">' + formatTokens(s.inputTokens) + ' in / ' + formatTokens(s.outputTokens) + ' out</span></div>';
-            metaRows += '<div class="meta-item"><span class="meta-label">Messages:</span> <span class="meta-value">' + s.messageCount + '</span></div>';
+            if (s.inputTokens > 0 || s.outputTokens > 0) {
+                metaRows += '<div class="meta-item"><span class="meta-label">Tokens:</span> <span class="meta-value">' + formatTokens(s.inputTokens) + ' in / ' + formatTokens(s.outputTokens) + ' out</span></div>';
+            }
+            if (s.messageCount > 0) {
+                metaRows += '<div class="meta-item"><span class="meta-label">Messages:</span> <span class="meta-value">' + s.messageCount + '</span></div>';
+            }
             if (s.subagentCount) {
                 metaRows += '<div class="meta-item"><span class="meta-label">Subagents:</span> <span class="meta-value">' + s.subagentCount + '</span></div>';
             }
