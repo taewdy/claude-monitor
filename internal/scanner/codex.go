@@ -35,17 +35,41 @@ func newCodexScanner(homeDir string) *codexScanner {
 // It tries the SQLite database first; if the threads table is empty, it falls
 // back to scanning rollout JSONL files directly.
 func (c *codexScanner) scan(ctx context.Context) ([]model.SessionInfo, error) {
-	// Try SQLite first.
-	sessions, err := c.scanFromDB(ctx)
-	if err != nil {
-		return nil, err
-	}
-	if len(sessions) > 0 {
-		return sessions, nil
-	}
+    // Read from both sources and merge, preferring freshest timestamps.
+    // This addresses Codex versions where DB rows can be stale while
+    // rollout files continue to be written.
+    dbSessions, err := c.scanFromDB(ctx)
+    if err != nil {
+        return nil, err
+    }
 
-	// Fallback: scan rollout files when DB is empty/missing.
-	return c.scanFromRolloutFiles(ctx)
+    rolloutSessions, err := c.scanFromRolloutFiles(ctx)
+    if err != nil {
+        return nil, err
+    }
+
+    // Merge by session ID, preferring entry with newer LastActive.
+    merged := make(map[string]model.SessionInfo, len(dbSessions)+len(rolloutSessions))
+    for _, s := range dbSessions {
+        merged[s.ID] = s
+    }
+    for _, s := range rolloutSessions {
+        if prev, ok := merged[s.ID]; ok {
+            if s.LastActive.After(prev.LastActive) {
+                merged[s.ID] = s
+            }
+        } else {
+            merged[s.ID] = s
+        }
+    }
+
+    // Flatten and sort by LastActive desc to match aggregator expectations.
+    out := make([]model.SessionInfo, 0, len(merged))
+    for _, s := range merged {
+        out = append(out, s)
+    }
+    sort.Slice(out, func(i, j int) bool { return out[i].LastActive.After(out[j].LastActive) })
+    return out, nil
 }
 
 // scanFromDB reads sessions from the SQLite threads table.
