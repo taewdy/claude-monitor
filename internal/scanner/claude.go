@@ -159,7 +159,8 @@ func (c *claudeScanner) parseConversation(path string, info *model.SessionInfo) 
 	}
 	defer f.Close()
 
-	lines := readTailLines(f, tailLines)
+	lines, total := readTailLines(f, tailLines)
+	info.MessageCount = total
 
 	var lastRole string
 	for _, line := range lines {
@@ -181,8 +182,6 @@ func (c *claudeScanner) parseConversation(path string, info *model.SessionInfo) 
 		if err := json.Unmarshal([]byte(line), &msg); err != nil {
 			continue
 		}
-
-		info.MessageCount++
 
 		if msg.Message != nil {
 			lastRole = msg.Message.Role
@@ -213,7 +212,8 @@ func (c *claudeScanner) parseConversation(path string, info *model.SessionInfo) 
 }
 
 // readTailLines reads the last n lines from a reader.
-func readTailLines(r io.Reader, n int) []string {
+// It returns the tail lines and the total number of non-empty lines.
+func readTailLines(r io.Reader, n int) ([]string, int) {
 	scanner := bufio.NewScanner(r)
 	var ring []string
 	for scanner.Scan() {
@@ -224,10 +224,11 @@ func readTailLines(r io.Reader, n int) []string {
 		ring = append(ring, text)
 	}
 
-	if len(ring) <= n {
-		return ring
+	total := len(ring)
+	if total <= n {
+		return ring, total
 	}
-	return ring[len(ring)-n:]
+	return ring[total-n:], total
 }
 
 // determineStatus applies the status rules using JSONL file mtime and PID:

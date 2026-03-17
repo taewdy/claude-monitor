@@ -429,7 +429,7 @@ func TestClaudeScanner_Scan(t *testing.T) {
 						LastActive:   staleTimestamp.Add(time.Second),
 						InputTokens:  100,
 						OutputTokens: 200,
-						MessageCount: 2,
+						MessageCount: 3,
 						PID:          999999999,
 					},
 				},
@@ -720,6 +720,9 @@ func TestClaudeScanner_TailParsing(t *testing.T) {
 			writeConversationJSONL(t, homeDir, encoded, sid, messages)
 
 			s := scanSingle(t, homeDir)
+			if s.MessageCount != tt.totalLines {
+				t.Errorf("MessageCount = %d, want %d", s.MessageCount, tt.totalLines)
+			}
 			if s.InputTokens != tt.inputTokens {
 				t.Errorf("InputTokens = %d, want %d", s.InputTokens, tt.inputTokens)
 			}
