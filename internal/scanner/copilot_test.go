@@ -25,16 +25,23 @@ type workspaceYAML struct {
 	Summary   string
 }
 
+// copilotEventInput is used in tests to specify events with time.Time values
+type copilotEventInput struct {
+	Type      string
+	Timestamp time.Time
+}
+
 // copilotEvent represents a single line in events.jsonl.
 type copilotEvent struct {
 	Type      string `json:"type"`
-	Timestamp int64  `json:"timestamp"`
+	Timestamp string `json:"timestamp"` // RFC3339 format
 }
 
 // ideLockFile represents the content of an IDE lock file.
 type ideLockFile struct {
-	PID     int    `json:"pid"`
-	IDEName string `json:"ideName"`
+	PID              int      `json:"pid"`
+	IDEName          string   `json:"ideName"`
+	WorkspaceFolders []string `json:"workspaceFolders"`
 }
 
 // ---------- test helpers ----------
@@ -69,7 +76,8 @@ summary: %s
 }
 
 // writeEventsJSONL writes an events.jsonl file for a copilot session.
-func writeEventsJSONL(t *testing.T, homeDir, sessionID string, events []copilotEvent) {
+// Input events use time.Time, which gets converted to RFC3339 format.
+func writeEventsJSONL(t *testing.T, homeDir, sessionID string, events []copilotEventInput) {
 	t.Helper()
 	dir := filepath.Join(homeDir, ".copilot", "session-state", sessionID)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -82,13 +90,18 @@ func writeEventsJSONL(t *testing.T, homeDir, sessionID string, events []copilotE
 	defer f.Close()
 	enc := json.NewEncoder(f)
 	for _, e := range events {
-		if err := enc.Encode(e); err != nil {
+		// Convert the event to RFC3339 format
+		event := copilotEvent{
+			Type:      e.Type,
+			Timestamp: e.Timestamp.UTC().Format(time.RFC3339),
+		}
+		if err := enc.Encode(event); err != nil {
 			t.Fatal(err)
 		}
 	}
 }
 
-// writeIDELockFile writes an IDE lock file for a copilot session.
+// writeIDELockFile writes an IDE lock file for a copilot session (using session ID as IDE UUID for backward compatibility in tests).
 func writeIDELockFile(t *testing.T, homeDir, sessionID string, lock ideLockFile) {
 	t.Helper()
 	dir := filepath.Join(homeDir, ".copilot", "ide")
@@ -100,6 +113,22 @@ func writeIDELockFile(t *testing.T, homeDir, sessionID string, lock ideLockFile)
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, sessionID+".lock"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// writeIDELockFileWithUUID writes an IDE lock file with a specific IDE UUID and workspace folders.
+func writeIDELockFileWithUUID(t *testing.T, homeDir, ideUUID string, lock ideLockFile) {
+	t.Helper()
+	dir := filepath.Join(homeDir, ".copilot", "ide")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(lock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ideUUID+".lock"), data, 0o644); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -188,8 +217,8 @@ func TestCopilotScanner_Scan(t *testing.T) {
 					UpdatedAt: now.Add(-5 * time.Second),
 					Summary:   "Implementing auth",
 				})
-				writeEventsJSONL(t, homeDir, sid, []copilotEvent{
-					{Type: "assistant.message", Timestamp: now.Add(-5 * time.Second).Unix()},
+				writeEventsJSONL(t, homeDir, sid, []copilotEventInput{
+					{Type: "assistant.message", Timestamp: now.Add(-5 * time.Second)},
 				})
 			},
 			sessions: []model.SessionInfo{
@@ -215,8 +244,8 @@ func TestCopilotScanner_Scan(t *testing.T) {
 					UpdatedAt: now.Add(-5 * time.Minute),
 					Summary:   "DB refactor",
 				})
-				writeEventsJSONL(t, homeDir, sid, []copilotEvent{
-					{Type: "assistant.message", Timestamp: now.Add(-5 * time.Minute).Unix()},
+				writeEventsJSONL(t, homeDir, sid, []copilotEventInput{
+					{Type: "assistant.message", Timestamp: now.Add(-5 * time.Minute)},
 				})
 			},
 			sessions: []model.SessionInfo{
@@ -242,9 +271,9 @@ func TestCopilotScanner_Scan(t *testing.T) {
 					UpdatedAt: now.Add(-10 * time.Second),
 					Summary:   "UI work",
 				})
-				writeEventsJSONL(t, homeDir, sid, []copilotEvent{
-					{Type: "user.message", Timestamp: now.Add(-30 * time.Second).Unix()},
-					{Type: "assistant.turn_end", Timestamp: now.Add(-10 * time.Second).Unix()},
+				writeEventsJSONL(t, homeDir, sid, []copilotEventInput{
+					{Type: "user.message", Timestamp: now.Add(-30 * time.Second)},
+					{Type: "assistant.turn_end", Timestamp: now.Add(-10 * time.Second)},
 				})
 			},
 			sessions: []model.SessionInfo{
@@ -270,10 +299,10 @@ func TestCopilotScanner_Scan(t *testing.T) {
 					UpdatedAt: now.Add(-2 * time.Hour),
 					Summary:   "Done task",
 				})
-				writeEventsJSONL(t, homeDir, sid, []copilotEvent{
-					{Type: "user.message", Timestamp: now.Add(-3 * time.Hour).Unix()},
-					{Type: "assistant.message", Timestamp: now.Add(-2*time.Hour - 30*time.Minute).Unix()},
-					{Type: "session.shutdown", Timestamp: now.Add(-2 * time.Hour).Unix()},
+				writeEventsJSONL(t, homeDir, sid, []copilotEventInput{
+					{Type: "user.message", Timestamp: now.Add(-3 * time.Hour)},
+					{Type: "assistant.message", Timestamp: now.Add(-2*time.Hour - 30*time.Minute)},
+					{Type: "session.shutdown", Timestamp: now.Add(-2 * time.Hour)},
 				})
 			},
 			sessions: []model.SessionInfo{
@@ -291,6 +320,7 @@ func TestCopilotScanner_Scan(t *testing.T) {
 			// IDE lock file exists with live PID but event > 2min ago → idle.
 			buildFS: func(t *testing.T, homeDir string) {
 				sid := "990e8400-e29b-41d4-a716-446655440004"
+				ideUUID := "ide-uuid-001"
 				writeWorkspaceYAML(t, homeDir, sid, workspaceYAML{
 					ID:        sid,
 					Cwd:       "/home/user/ide-proj",
@@ -299,12 +329,13 @@ func TestCopilotScanner_Scan(t *testing.T) {
 					UpdatedAt: now.Add(-3 * time.Minute),
 					Summary:   "IDE session",
 				})
-				writeEventsJSONL(t, homeDir, sid, []copilotEvent{
-					{Type: "assistant.message", Timestamp: now.Add(-3 * time.Minute).Unix()},
+				writeEventsJSONL(t, homeDir, sid, []copilotEventInput{
+					{Type: "assistant.message", Timestamp: now.Add(-3 * time.Minute)},
 				})
-				writeIDELockFile(t, homeDir, sid, ideLockFile{
-					PID:     os.Getpid(), // Use current PID so it's alive.
-					IDEName: "vscode",
+				writeIDELockFileWithUUID(t, homeDir, ideUUID, ideLockFile{
+					PID:              os.Getpid(), // Use current PID so it's alive.
+					IDEName:          "vscode",
+					WorkspaceFolders: []string{"/home/user/ide-proj"},
 				})
 			},
 			sessions: []model.SessionInfo{
@@ -326,8 +357,8 @@ func TestCopilotScanner_Scan(t *testing.T) {
 					CreatedAt: now.Add(-1 * time.Hour), UpdatedAt: now.Add(-5 * time.Second),
 					Summary: "Active",
 				})
-				writeEventsJSONL(t, homeDir, "uuid-active", []copilotEvent{
-					{Type: "assistant.message", Timestamp: now.Add(-5 * time.Second).Unix()},
+				writeEventsJSONL(t, homeDir, "uuid-active", []copilotEventInput{
+					{Type: "assistant.message", Timestamp: now.Add(-5 * time.Second)},
 				})
 
 				// Finished session
@@ -336,8 +367,8 @@ func TestCopilotScanner_Scan(t *testing.T) {
 					CreatedAt: now.Add(-5 * time.Hour), UpdatedAt: now.Add(-4 * time.Hour),
 					Summary: "Done",
 				})
-				writeEventsJSONL(t, homeDir, "uuid-done", []copilotEvent{
-					{Type: "session.shutdown", Timestamp: now.Add(-4 * time.Hour).Unix()},
+				writeEventsJSONL(t, homeDir, "uuid-done", []copilotEventInput{
+					{Type: "session.shutdown", Timestamp: now.Add(-4 * time.Hour)},
 				})
 			},
 			count: 2,
@@ -508,8 +539,8 @@ func TestCopilotScanner_Scan(t *testing.T) {
 					ID: sid, Cwd: "/proj",
 					CreatedAt: now.Add(-1 * time.Hour), UpdatedAt: now,
 				})
-				writeEventsJSONL(t, homeDir, sid, []copilotEvent{
-					{Type: "session.shutdown", Timestamp: now.Unix()},
+				writeEventsJSONL(t, homeDir, sid, []copilotEventInput{
+					{Type: "session.shutdown", Timestamp: now},
 				})
 			},
 			sessions: []model.SessionInfo{
@@ -530,8 +561,8 @@ func TestCopilotScanner_Scan(t *testing.T) {
 					ID: sid, Cwd: "",
 					CreatedAt: now.Add(-1 * time.Hour), UpdatedAt: now,
 				})
-				writeEventsJSONL(t, homeDir, sid, []copilotEvent{
-					{Type: "session.shutdown", Timestamp: now.Unix()},
+				writeEventsJSONL(t, homeDir, sid, []copilotEventInput{
+					{Type: "session.shutdown", Timestamp: now},
 				})
 			},
 			sessions: []model.SessionInfo{
@@ -600,8 +631,8 @@ func TestCopilotScanner_StatusDetermination(t *testing.T) {
 		"no_shutdown_recent_event_is_active": {
 			// Last event < 60s ago, no shutdown → active.
 			buildFS: func(t *testing.T, homeDir, sid string) {
-				writeEventsJSONL(t, homeDir, sid, []copilotEvent{
-					{Type: "assistant.message", Timestamp: now.Add(-10 * time.Second).Unix()},
+				writeEventsJSONL(t, homeDir, sid, []copilotEventInput{
+					{Type: "assistant.message", Timestamp: now.Add(-10 * time.Second)},
 				})
 			},
 			status: model.StatusActive,
@@ -609,8 +640,8 @@ func TestCopilotScanner_StatusDetermination(t *testing.T) {
 		"no_shutdown_stale_event_no_lock_is_finished": {
 			// Last event > 2min ago, no shutdown, no lock → finished.
 			buildFS: func(t *testing.T, homeDir, sid string) {
-				writeEventsJSONL(t, homeDir, sid, []copilotEvent{
-					{Type: "assistant.message", Timestamp: now.Add(-5 * time.Minute).Unix()},
+				writeEventsJSONL(t, homeDir, sid, []copilotEventInput{
+					{Type: "assistant.message", Timestamp: now.Add(-5 * time.Minute)},
 				})
 			},
 			status: model.StatusFinished,
@@ -618,9 +649,9 @@ func TestCopilotScanner_StatusDetermination(t *testing.T) {
 		"last_event_assistant_turn_end_is_waiting": {
 			// Last event is assistant.turn_end → waiting.
 			buildFS: func(t *testing.T, homeDir, sid string) {
-				writeEventsJSONL(t, homeDir, sid, []copilotEvent{
-					{Type: "user.message", Timestamp: now.Add(-30 * time.Second).Unix()},
-					{Type: "assistant.turn_end", Timestamp: now.Add(-15 * time.Second).Unix()},
+				writeEventsJSONL(t, homeDir, sid, []copilotEventInput{
+					{Type: "user.message", Timestamp: now.Add(-30 * time.Second)},
+					{Type: "assistant.turn_end", Timestamp: now.Add(-15 * time.Second)},
 				})
 			},
 			status: model.StatusWaiting,
@@ -628,9 +659,9 @@ func TestCopilotScanner_StatusDetermination(t *testing.T) {
 		"shutdown_event_is_finished": {
 			// Has session.shutdown → finished.
 			buildFS: func(t *testing.T, homeDir, sid string) {
-				writeEventsJSONL(t, homeDir, sid, []copilotEvent{
-					{Type: "user.message", Timestamp: now.Add(-1 * time.Hour).Unix()},
-					{Type: "session.shutdown", Timestamp: now.Add(-30 * time.Minute).Unix()},
+				writeEventsJSONL(t, homeDir, sid, []copilotEventInput{
+					{Type: "user.message", Timestamp: now.Add(-1 * time.Hour)},
+					{Type: "session.shutdown", Timestamp: now.Add(-30 * time.Minute)},
 				})
 			},
 			status: model.StatusFinished,
@@ -638,12 +669,14 @@ func TestCopilotScanner_StatusDetermination(t *testing.T) {
 		"ide_lock_alive_pid_stale_event_is_idle": {
 			// Event is stale (> 2 min) + IDE lock with alive PID → idle.
 			buildFS: func(t *testing.T, homeDir, sid string) {
-				writeEventsJSONL(t, homeDir, sid, []copilotEvent{
-					{Type: "assistant.message", Timestamp: now.Add(-5 * time.Minute).Unix()},
+				writeEventsJSONL(t, homeDir, sid, []copilotEventInput{
+					{Type: "assistant.message", Timestamp: now.Add(-5 * time.Minute)},
 				})
-				writeIDELockFile(t, homeDir, sid, ideLockFile{
-					PID:     os.Getpid(),
-					IDEName: "vscode",
+				ideUUID := "test-ide-uuid"
+				writeIDELockFileWithUUID(t, homeDir, ideUUID, ideLockFile{
+					PID:              os.Getpid(),
+					IDEName:          "vscode",
+					WorkspaceFolders: []string{"/proj"},
 				})
 			},
 			status: model.StatusIdle,
@@ -651,12 +684,14 @@ func TestCopilotScanner_StatusDetermination(t *testing.T) {
 		"ide_lock_dead_pid_stale_event_is_finished": {
 			// IDE lock exists but PID is dead + stale event → finished.
 			buildFS: func(t *testing.T, homeDir, sid string) {
-				writeEventsJSONL(t, homeDir, sid, []copilotEvent{
-					{Type: "assistant.message", Timestamp: now.Add(-5 * time.Minute).Unix()},
+				writeEventsJSONL(t, homeDir, sid, []copilotEventInput{
+					{Type: "assistant.message", Timestamp: now.Add(-5 * time.Minute)},
 				})
-				writeIDELockFile(t, homeDir, sid, ideLockFile{
-					PID:     999999999, // Dead PID.
-					IDEName: "vscode",
+				ideUUID := "test-ide-uuid-dead"
+				writeIDELockFileWithUUID(t, homeDir, ideUUID, ideLockFile{
+					PID:              999999999, // Dead PID.
+					IDEName:          "vscode",
+					WorkspaceFolders: []string{"/proj"},
 				})
 			},
 			status: model.StatusFinished,
@@ -664,8 +699,8 @@ func TestCopilotScanner_StatusDetermination(t *testing.T) {
 		"session_lock_alive_pid_stale_event_is_idle": {
 			// Stale event (> 2 min) + inuse.*.lock with alive PID → idle.
 			buildFS: func(t *testing.T, homeDir, sid string) {
-				writeEventsJSONL(t, homeDir, sid, []copilotEvent{
-					{Type: "assistant.message", Timestamp: now.Add(-5 * time.Minute).Unix()},
+				writeEventsJSONL(t, homeDir, sid, []copilotEventInput{
+					{Type: "assistant.message", Timestamp: now.Add(-5 * time.Minute)},
 				})
 				writeSessionLockFile(t, homeDir, sid, os.Getpid())
 			},
@@ -674,8 +709,8 @@ func TestCopilotScanner_StatusDetermination(t *testing.T) {
 		"session_lock_dead_pid_stale_event_is_finished": {
 			// inuse.*.lock with dead PID + stale event → finished.
 			buildFS: func(t *testing.T, homeDir, sid string) {
-				writeEventsJSONL(t, homeDir, sid, []copilotEvent{
-					{Type: "assistant.message", Timestamp: now.Add(-5 * time.Minute).Unix()},
+				writeEventsJSONL(t, homeDir, sid, []copilotEventInput{
+					{Type: "assistant.message", Timestamp: now.Add(-5 * time.Minute)},
 				})
 				writeSessionLockFile(t, homeDir, sid, 999999999)
 			},
@@ -768,8 +803,8 @@ func TestCopilotScanner_StatusBoundaries(t *testing.T) {
 				ID: sid, Cwd: "/proj",
 				CreatedAt: now.Add(-1 * time.Hour), UpdatedAt: now,
 			})
-			writeEventsJSONL(t, homeDir, sid, []copilotEvent{
-				{Type: "user.message", Timestamp: now.Add(-tt.lastEventAge).Unix()},
+			writeEventsJSONL(t, homeDir, sid, []copilotEventInput{
+				{Type: "user.message", Timestamp: now.Add(-tt.lastEventAge)},
 			})
 
 			cs := newCopilotScanner(homeDir)
@@ -811,8 +846,8 @@ func TestCopilotScanner_SortedByUpdatedAtDesc(t *testing.T) {
 			CreatedAt: now.Add(-5 * time.Hour), UpdatedAt: s.updatedAt,
 			Summary: s.id,
 		})
-		writeEventsJSONL(t, homeDir, s.id, []copilotEvent{
-			{Type: "session.shutdown", Timestamp: s.updatedAt.Unix()},
+		writeEventsJSONL(t, homeDir, s.id, []copilotEventInput{
+			{Type: "session.shutdown", Timestamp: s.updatedAt},
 		})
 	}
 
