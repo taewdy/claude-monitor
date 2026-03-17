@@ -9,6 +9,8 @@ Monitors AI coding assistant sessions (Claude Code, OpenAI Codex CLI, GitHub Cop
 - Web dashboard on localhost
 - Alerts via Slack, Teams, or macOS desktop notifications when sessions exit active state
 
+![Dashboard screenshot](./dashboard.png)
+
 ## Usage
 
 **Build:**
